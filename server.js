@@ -614,30 +614,28 @@ function buildStudioInstruction(payload) {
   return `Anda adalah "AI Prompt Studio" profesional.
 Buat instruksi visual yang sangat mendetail untuk generator gambar AI (seperti Midjourney atau DALL-E 3) yang dioptimalkan untuk Microstock.
 
-Output harus dalam bahasa: ${targetLang}.
+Output dalam bahasa: ${targetLang}.
 
-Template Utama:
+Template:
 Foto [Tujuan] yang menampilkan [Objek] dengan [Ekspresi], sedang [Aktivitas], berlatar [Background].
 
-Aturan Mode:
-- Jika Mode=AUTO: Kembangkan ekspresi, aktivitas, dan background secara kreatif berdasarkan tujuan foto dan objek agar hasilnya variatif dan bernilai jual tinggi.
-- Jika Mode=MANUAL: Gunakan nilai ekspresi/aktivitas/background yang diberikan pengguna secara presisi.
+Aturan:
+- Mode=AUTO: Kembangkan ekspresi/aktivitas/background secara kreatif.
+- Mode=MANUAL: Gunakan nilai dari user secara presisi.
 
 Batching:
 - Buat tepat ${n} unik prompt.
-- Variasikan framing (close-up, medium, wide), pencahayaan (natural, golden hour, studio), dan sudut kamera untuk setiap entri.
+- Variasi framing, pencahayaan, dan sudut kamera.
 
 Output:
-Keluarkan HANYA JSON VALID (tanpa markdown):
+HANYA JSON VALID:
 {
   "results": [
-    {
-      "prompt": "..."
-    }
+    { "prompt": "..." }
   ]
 }
 
-DATA USER:
+DATA:
 Mode: ${mode}
 Tujuan: ${tujuan}
 Objek: ${objek}
