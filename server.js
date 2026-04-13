@@ -116,55 +116,7 @@ app.get("/api/auth/me", (req, res) => {
 // Keeps track of the last used key index per user to ensure Round Robin across requests
 const userRotationIndex = new Map();
 
-// --- IMAGE TO PROMPT HELPERS ---
-async function callGeminiImgToPromptWithRetry({ apiKeys, userId, model, prompt, imageBuffer }) {
-  let startIndex = userRotationIndex.get(userId) || 0;
-  let attempts = 0;
-  const maxAttempts = apiKeys.length;
 
-  while (attempts < maxAttempts) {
-    const currentIndex = (startIndex + attempts) % apiKeys.length;
-    const apiKey = apiKeys[currentIndex];
-    userRotationIndex.set(userId, (currentIndex + 1) % apiKeys.length);
-
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${apiKey}`;
-      const parts = [
-        { text: prompt },
-        {
-          inline_data: {
-            mime_type: "image/jpeg",
-            data: imageBuffer.toString("base64")
-          }
-        }
-      ];
-
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts }] })
-      });
-
-      if (response.status === 429) {
-        console.warn(`Key ${currentIndex} rate limited (429). Retrying...`);
-        attempts++;
-        continue;
-      }
-
-      if (!response.ok) {
-        const payload = await response.text();
-        throw new Error(`Gemini failed: ${response.status} ${payload}`);
-      }
-
-      const data = await response.json();
-      return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-    } catch (err) {
-      if (attempts === maxAttempts - 1) throw err;
-      attempts++;
-    }
-  }
-  throw new Error("All API keys are rate limited or failed.");
-}
 
 // --- VECTOR CONVERSION ROUTE ---
 app.post("/api/convert-vector", isAuthenticated, upload.single("file"), async (req, res) => {
@@ -551,10 +503,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`SASTOCK metadata tool listening on http://localhost:${PORT}`);
-});
+
 
 
 // --- IMG TO PROMPT ROUTE ---
@@ -602,44 +551,6 @@ ${camera ? "- Include professional camera settings (lens, lighting, aperture, et
     }
   }
   res.json({ results });
-});
-
-// Single image version for robust batch processing
-app.post("/api/imgtoprompt/single", isAuthenticated, upload.single("image"), async (req, res) => {
-  const file = req.file;
-  const userId = req.session.userId;
-  const { model, creativity, camera } = req.body;
-
-  if (!file) return res.status(400).json({ error: "No image uploaded" });
-
-  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(userId);
-  const apiKeys = savedKeys.map(k => k.key_value);
-  if (!apiKeys.length) return res.status(400).json({ error: "Empty API keys" });
-
-  try {
-    const creativityVal = Math.max(0, Math.min(100, Number(creativity || 50)));
-    const cameraOn = camera === "true" || camera === "on";
-    
-    const promptText = `Analyze this image and generate a high-quality, professional prompt for AI image generators (like Midjourney or Stable Diffusion). 
-Realistic, natural, commercial stock style.
-Creativity: ${creativityVal}/100.
-${cameraOn ? "Include camera settings." : ""}
-NO words: cyber, futuristic, sci-fi, robot, ai, hologram, technology, logo, brand, watermark.
-Return ONLY the prompt text.`;
-
-    const prompt = await callGeminiImgToPromptWithRetry({
-      apiKeys,
-      userId,
-      model: model || "gemini-3-flash-preview",
-      prompt: promptText,
-      imageBuffer: file.buffer
-    });
-
-    res.json({ fileName: file.originalname, prompt });
-  } catch (err) {
-    console.error(`[ImgToPromptSingle] Error: ${err.message}`);
-    res.status(500).json({ error: err.message });
-  }
 });
 
 // --- SDK HELPERS FOR PROMPT STUDIO & IMG TO PROMPT ---
@@ -779,4 +690,17 @@ Return ONLY the prompt text.`;
     console.error(`[ImgToPrompt SDK] Error: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
+});
+
+// --- ERROR HANDLER ---
+app.use("/api", (err, req, res, next) => {
+  console.error(err);
+  res.status(err.status || 500).json({
+    error: err.message || "Internal server error"
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`SASTOCK metadata tool listening on http://localhost:${PORT}`);
 });

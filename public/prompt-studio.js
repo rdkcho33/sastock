@@ -40,7 +40,12 @@ if (clearLogBtn) {
 async function init() {
   try {
     const res = await fetch("/api/auth/me");
-    const auth = await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    const auth = JSON.parse(raw);
     if (!auth.authenticated) {
       window.location.href = "/login.html";
       return;
@@ -59,7 +64,12 @@ async function init() {
 async function fetchKeys() {
   try {
     const res = await fetch("/api/keys");
-    const data = await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    const data = JSON.parse(raw);
     const select = document.getElementById("activeKeySelect");
     
     if (data.keys && data.keys.length > 0) {
@@ -117,11 +127,21 @@ generateBtn.onclick = async () => {
       });
       
       if (!res.ok) {
-        const errData = await res.json();
+        const contentType = res.headers.get("content-type") || "";
+        const raw = await res.text();
+        if (!contentType.includes("application/json")) {
+          throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+        }
+        const errData = JSON.parse(raw);
         throw new Error(errData.error || "Generation failed");
       }
       
-      const data = await res.json();
+      const contentType = res.headers.get("content-type") || "";
+      const raw = await res.text();
+      if (!contentType.includes("application/json")) {
+        throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+      }
+      const data = JSON.parse(raw);
       updateCard(tempId, data.prompt);
       state.results.push(data.prompt);
       logToConsole(`[${i+1}/${batchCount}] Success!`, "success");

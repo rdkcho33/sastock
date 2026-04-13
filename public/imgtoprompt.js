@@ -79,7 +79,12 @@ async function init() {
 async function checkAuth() {
   try {
     const res = await fetch("/api/auth/me");
-    return await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    return JSON.parse(raw);
   } catch (err) {
     return { authenticated: false };
   }
@@ -142,7 +147,12 @@ async function processVectorFile(fileItem) {
       body: formData
     });
     if (!res.ok) throw new Error("Conversion failed");
-    const data = await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    const data = JSON.parse(raw);
     fileItem.previewUrl = `data:image/png;base64,${data.png}`;
     fileItem.status = "pending";
     logToConsole(`Vector converted: ${fileItem.file.name}`, "success");
@@ -242,11 +252,21 @@ runBtn.onclick = async () => {
       });
       
       if (!res.ok) {
-          const errData = await res.json();
+          const contentType = res.headers.get("content-type") || "";
+          const raw = await res.text();
+          if (!contentType.includes("application/json")) {
+            throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+          }
+          const errData = JSON.parse(raw);
           throw new Error(errData.error || "Failed");
       }
 
-      const data = await res.json();
+      const contentType = res.headers.get("content-type") || "";
+      const raw = await res.text();
+      if (!contentType.includes("application/json")) {
+        throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+      }
+      const data = JSON.parse(raw);
       state.results.push({ fileName: fileItem.file.name, prompt: data.prompt, error: null });
       logToConsole(`[${i+1}/${state.files.length}] Success: ${fileItem.file.name}`, "success");
     } catch (err) {

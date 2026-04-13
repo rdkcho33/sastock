@@ -92,7 +92,12 @@ const state = {
 async function checkAuth() {
   try {
     const res = await fetch("/api/auth/me");
-    const data = await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    const data = JSON.parse(raw);
     if (!data.authenticated) {
       window.location.href = "/login.html";
       return;
@@ -118,7 +123,12 @@ async function checkAuth() {
 async function fetchKeys() {
   try {
     const res = await fetch("/api/keys");
-    const data = await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    const data = JSON.parse(raw);
     state.keys = data.keys;
     renderKeySelector();
     renderKeyList();
@@ -192,7 +202,12 @@ addKeyForm.onsubmit = async (e) => {
       body: JSON.stringify({ keys })
     });
     
-    const data = await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    const data = JSON.parse(raw);
     
     if (res.ok) {
       addKeyForm.reset();
@@ -225,7 +240,12 @@ closeAdminModal.onclick = () => adminModal.classList.remove("active");
 async function fetchUsers() {
   try {
     const res = await fetch("/api/admin/users");
-    const data = await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    const data = JSON.parse(raw);
     renderUserList(data.users);
   } catch (err) {
     console.error("Failed to fetch users", err);
@@ -274,7 +294,12 @@ addUserForm.onsubmit = async (e) => {
       addUserForm.reset();
       await fetchUsers();
     } else {
-      const data = await res.json();
+      const contentType = res.headers.get("content-type") || "";
+      const raw = await res.text();
+      if (!contentType.includes("application/json")) {
+        throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+      }
+      const data = JSON.parse(raw);
       alert(data.error || "Failed to create user");
     }
   } catch (err) {
@@ -537,7 +562,12 @@ async function processVectorFile(fileItem) {
     
     if (!res.ok) throw new Error("Conversion failed");
     
-    const data = await res.json();
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+    }
+    const data = JSON.parse(raw);
     fileItem.previewUrl = `data:image/png;base64,${data.png}`;
     fileItem.status = "pending";
     logToConsole(`Vector converted: ${fileItem.file.name}`, "success");
@@ -628,7 +658,12 @@ async function runGeneration(items) {
       renderCards();
 
       const response = await fetch("/api/generate", { method: "POST", body: form });
-      const data = await response.json();
+      const contentType = response.headers.get("content-type") || "";
+      const raw = await response.text();
+      if (!contentType.includes("application/json")) {
+        throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+      }
+      const data = JSON.parse(raw);
       
       if (!response.ok) throw new Error(data.error || "Server error");
 
