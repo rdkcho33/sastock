@@ -457,7 +457,9 @@ async function callGeminiWithRetry({ apiKeys, userId, model, prompt, visualPart 
       return {
         title: parsed.title.trim(),
         description: parsed.description.trim().slice(0, 150),
-        keywords: parsed.keywords.map((v) => String(v).trim()).filter(Boolean)
+        keywords: parsed.keywords.map((v) => String(v).trim()).filter(Boolean),
+        categoryAdobe: parsed.categoryAdobe || 1,
+        categoryShutterstock: parsed.categoryShutterstock || "People"
       };
     } catch (err) {
       if (attempts === maxAttempts - 1) throw err;
@@ -518,6 +520,8 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
       entry.title = result.title;
       entry.description = result.description;
       entry.keywords = result.keywords;
+      entry.adobeCategory = result.categoryAdobe;
+      entry.shutterstockCategory = result.categoryShutterstock;
       entry.status = "done";
     } catch (error) {
       entry.status = "failed";
