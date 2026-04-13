@@ -133,8 +133,8 @@ generateBtn.onclick = async () => {
     generateBtn.innerHTML = `<span>Generating ${i+1}/${batchCount}...</span>`;
     if (state.results.length > 0) copyAllBtn.style.display = "inline-block";
     
-    // Tiny delay to keep it smooth
-    await new Promise(r => setTimeout(r, 200));
+    // Set 2 second delay to avoid Gemini rate limits
+    await new Promise(r => setTimeout(r, 2000));
   }
   
   state.isGenerating = false;

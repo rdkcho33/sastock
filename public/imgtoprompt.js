@@ -257,8 +257,8 @@ runBtn.onclick = async () => {
     // Render results immediately after each image is done
     renderResults(state.results);
     
-    // Optional: Small delay between items to avoid aggressive rate limiting
-    await new Promise(r => setTimeout(r, 300));
+    // Set 2 second delay to avoid Gemini rate limits
+    await new Promise(r => setTimeout(r, 2000));
   }
 
   runBtn.disabled = false;
