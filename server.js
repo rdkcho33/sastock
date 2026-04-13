@@ -639,4 +639,50 @@ Return ONLY the prompt text.`;
     console.error(`[ImgToPromptSingle] Error: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
+});
+
+// --- NEW PROMPT STUDIO ENDPOINT ---
+app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
+  const { purpose, object, lang, model } = req.body;
+  const userId = req.session.userId;
+
+  if (!purpose || !object) {
+    return res.status(400).json({ error: "Purpose and Object are required." });
+  }
+
+  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(userId);
+  const apiKeys = savedKeys.map(k => k.key_value);
+  if (!apiKeys.length) return res.status(400).json({ error: "Empty API keys" });
+
+  try {
+    const systemPrompt = `You are a professional stock photographer and AI prompt expert.
+Your task is to generate a high-quality, realistic, and commercially viable AI image prompt.
+
+CORE RULES:
+- STYLE: Purely realistic photography. NO futuristic, NO sci-fi, NO 3D rendering style, NO digital art look.
+- QUALITY: Use terms like "8k, ultra-realistic, highly detailed, professional cinematography, commercial stock photography".
+- CAMERA: Intelligently determine the best camera settings (e.g., f/1.8 for portraits, f/8 for landscapes, shutter speeds, etc.) based on the purpose.
+- EXCLUSIONS: NEVER use words: ai, futuristic, robot, tech, sci-fi, watermark, text, signature.
+
+INPUTS:
+1. Purpose: ${purpose}
+2. Object: ${object}
+3. Language: ${lang === 'id' ? 'Indonesian' : 'English'}
+
+The resulting prompt must be written in ${lang === 'id' ? 'Indonesian' : 'English'}.
+
+Return ONLY the final prompt text. No explanations.`;
+
+    const prompt = await callGeminiWithRetry({
+      apiKeys,
+      userId,
+      model: model || "gemini-3-flash-preview",
+      prompt: systemPrompt
+    });
+
+    res.json({ prompt });
+  } catch (err) {
+    console.error(`[PromptStudio] Error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });
