@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Img To Prompt Studio - SASTOCK</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    
+    <!-- LEFT SIDEBAR -->
+    <aside class="sidebar">
+      <div class="panel controls-panel">
+        <div class="panel-header">
+          <div class="brand">
+            <div class="brand-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
+            </div>
+            <div>
+              <h1>Studio</h1>
+              <p>Image to Prompt</p>
+            </div>
+          </div>
+          
+          <div id="userProfile" class="user-profile" style="display: none;">
+            <div class="user-info">
+              <span id="userName">User</span>
+              <span id="userRole" class="badge-role">User</span>
+            </div>
+            <div class="user-actions">
+              <button id="logoutBtn" class="btn-logout" title="Logout">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <nav class="nav-menu">
+           <a href="index.html" class="nav-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="3" y1="15" x2="9" y2="15"></line><line x1="3" y1="18" x2="9" y2="18"></line></svg>
+              <span>Metadata Tool</span>
+           </a>
+           <a href="imgtoprompt.html" class="nav-item active">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+              <span>Img To Prompt</span>
+           </a>
+           <a href="promptgen.html" class="nav-item">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+              <span>Prompt Generator</span>
+           </a>
+        </nav>
+
+        <hr class="divider" />
+
+        <div class="gemini-settings" style="margin-top: 20px;">
+          <label class="section-label flex-between">
+            <span>MODEL</span>
+            <span class="value-badge">Free Tier</span>
+          </label>
+          <select id="modelSelect" class="key-selector">
+            <option value="gemini-3-flash-preview" selected>gemini-3-flash-preview</option>
+            <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+            <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+          </select>
+
+          <label class="section-label flex-between" style="margin-top: 15px;">
+            <span>CREATIVITY</span>
+            <span class="value-badge"><span id="creativityValue">50</span>%</span>
+          </label>
+          <input id="creativitySlider" type="range" class="styled-range" min="0" max="100" value="50" />
+          
+          <div class="option-row" style="margin-top: 20px;">
+            <label class="toggle-switch">
+              <input type="checkbox" id="cameraSwitch">
+              <span class="slider round"></span>
+            </label>
+            <span style="font-size: 13px;">Suggest Camera Settings</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- MAIN CONTENT -->
+    <main class="main-content">
+      <div class="panel upload-panel">
+        <div class="upload-header">
+           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+           <h2>Visual Analysis</h2>
+        </div>
+        
+        <div id="dropZone" class="dropzone-container">
+           <div class="dropzone-icon">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+           </div>
+           <h3>Drop images here to generate prompts</h3>
+           <p>Drag & drop or <span class="text-primary">click to browse</span></p>
+           <input id="fileInput" type="file" accept="image/*" multiple style="display:none;" />
+        </div>
+      </div>
+
+      <section class="queue-toolbar">
+         <div class="queue-stats">
+            <span id="fileCount" class="text-white font-medium">0 images selected</span>
+         </div>
+         <div class="queue-actions">
+            <button id="copyAllBtn" class="btn btn-secondary" style="display:none; margin-right: 8px;">Copy All Prompts</button>
+            <button id="clearBtn" class="btn btn-danger">Clear</button>
+            <button id="runBtn" class="btn btn-primary">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+              Generate All Prompts
+            </button>
+         </div>
+      </section>
+
+      <div id="resultsGrid" class="results-grid">
+         <!-- Results will be injected here -->
+      </div>
+    </main>
+  </div>
+
+  <script src="imgtoprompt.js"></script>
+</body>
+</html>
