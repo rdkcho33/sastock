@@ -601,4 +601,42 @@ ${camera ? "- Include professional camera settings (lens, lighting, aperture, et
     }
   }
   res.json({ results });
+});
+
+// Single image version for robust batch processing
+app.post("/api/imgtoprompt/single", isAuthenticated, upload.single("image"), async (req, res) => {
+  const file = req.file;
+  const userId = req.session.userId;
+  const { model, creativity, camera } = req.body;
+
+  if (!file) return res.status(400).json({ error: "No image uploaded" });
+
+  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(userId);
+  const apiKeys = savedKeys.map(k => k.key_value);
+  if (!apiKeys.length) return res.status(400).json({ error: "Empty API keys" });
+
+  try {
+    const creativityVal = Math.max(0, Math.min(100, Number(creativity || 50)));
+    const cameraOn = camera === "true" || camera === "on";
+    
+    const promptText = `Analyze this image and generate a high-quality, professional prompt for AI image generators (like Midjourney or Stable Diffusion). 
+Realistic, natural, commercial stock style.
+Creativity: ${creativityVal}/100.
+${cameraOn ? "Include camera settings." : ""}
+NO words: cyber, futuristic, sci-fi, robot, ai, hologram, technology, logo, brand, watermark.
+Return ONLY the prompt text.`;
+
+    const prompt = await callGeminiImgToPromptWithRetry({
+      apiKeys,
+      userId,
+      model: model || "gemini-3-flash-preview",
+      prompt: promptText,
+      imageBuffer: file.buffer
+    });
+
+    res.json({ fileName: file.originalname, prompt });
+  } catch (err) {
+    console.error(`[ImgToPromptSingle] Error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
 });

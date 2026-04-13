@@ -216,45 +216,59 @@ runBtn.onclick = async () => {
   if (state.files.length === 0) return alert("Please select images first.");
   
   runBtn.disabled = true;
-  runBtn.innerHTML = "Processing...";
+  runBtn.innerHTML = "Processing Queue...";
   resultsGrid.innerHTML = "";
+  state.results = [];
   copyAllBtn.style.display = "none";
   
-  logToConsole(`Analyzing ${state.files.length} images...`, "info");
+  logToConsole(`Starting batch process for ${state.files.length} images...`, "info");
 
-  const formData = new FormData();
-  state.files.forEach(f => formData.append("images", f.file));
-  formData.append("model", document.getElementById("modelSelect").value);
-  formData.append("creativity", creativitySlider.value);
-  formData.append("camera", cameraSwitch.checked ? "on" : "off");
-
-  try {
-    const res = await fetch("/api/imgtoprompt", {
-      method: "POST",
-      body: formData
-    });
+  for (let i = 0; i < state.files.length; i++) {
+    const fileItem = state.files[i];
     
-    if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || "Failed to generate prompts");
-    }
+    // Create a mini-log for this image
+    logToConsole(`[${i+1}/${state.files.length}] Processing: ${fileItem.file.name}`, "info");
 
-    const data = await res.json();
-    state.results = data.results;
-    const successCount = (data.results || []).filter(r => !r.error).length;
-    logToConsole(`Finished! Generated ${successCount} prompts successfully.`, "success");
-    renderResults(data.results);
-    
-    // Show copy all button if we have results
-    if (state.results.length > 0) {
-      copyAllBtn.style.display = "inline-block";
+    const formData = new FormData();
+    formData.append("image", fileItem.file);
+    formData.append("model", document.getElementById("modelSelect").value);
+    formData.append("creativity", creativitySlider.value);
+    formData.append("camera", cameraSwitch.checked ? "on" : "off");
+
+    try {
+      const res = await fetch("/api/imgtoprompt/single", {
+        method: "POST",
+        body: formData
+      });
+      
+      if (!res.ok) {
+          const errData = await res.json();
+          throw new Error(errData.error || "Failed");
+      }
+
+      const data = await res.json();
+      state.results.push({ fileName: fileItem.file.name, prompt: data.prompt, error: null });
+      logToConsole(`[${i+1}/${state.files.length}] Success: ${fileItem.file.name}`, "success");
+    } catch (err) {
+      logToConsole(`[${i+1}/${state.files.length}] Failed: ${fileItem.file.name} - ${err.message}`, "error");
+      state.results.push({ fileName: fileItem.file.name, prompt: "", error: err.message });
     }
-  } catch (err) {
-    logToConsole(`Error: ${err.message}`, "error");
-    alert(err.message);
-  } finally {
-    runBtn.disabled = false;
-    runBtn.innerHTML = "Generate All Prompts";
+    
+    // Render results immediately after each image is done
+    renderResults(state.results);
+    
+    // Optional: Small delay between items to avoid aggressive rate limiting
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  runBtn.disabled = false;
+  runBtn.innerHTML = "Generate All Prompts";
+  
+  const successCount = state.results.filter(r => !r.error).length;
+  logToConsole(`Batch finished! ${successCount}/${state.files.length} successful.`, "success");
+  
+  if (successCount > 0) {
+    copyAllBtn.style.display = "inline-block";
   }
 };
 
