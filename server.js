@@ -1,4 +1,5 @@
 import express from "express";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -588,7 +589,7 @@ ${camera ? "- Include professional camera settings (lens, lighting, aperture, et
   for (const file of images) {
     try {
       const promptText = buildImgPrompt();
-      const prompt = await callGeminiImgToPromptWithRetry({
+      const prompt = await callGeminiMultimodalWithSDK({
         apiKeys,
         userId: req.session.userId,
         model,
@@ -641,7 +642,75 @@ Return ONLY the prompt text.`;
   }
 });
 
-// --- NEW PROMPT STUDIO ENDPOINT ---
+// --- SDK HELPERS FOR PROMPT STUDIO & IMG TO PROMPT ---
+
+async function callGeminiWithSDK({ apiKeys, userId, model: modelId, prompt }) {
+  let startIndex = userRotationIndex.get(userId) || 0;
+  let attempts = 0;
+  const maxAttempts = apiKeys.length;
+
+  while (attempts < maxAttempts) {
+    const currentIndex = (startIndex + attempts) % apiKeys.length;
+    const apiKey = apiKeys[currentIndex];
+    userRotationIndex.set(userId, (currentIndex + 1) % apiKeys.length);
+
+    try {
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: modelId });
+      
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      return response.text().trim();
+    } catch (err) {
+      console.error(`[SDK Text] Attempt ${attempts} failed with Key ${currentIndex}: ${err.message}`);
+      if (err.message.includes("429") || err.message.toLowerCase().includes("quota") || err.message.toLowerCase().includes("limit")) {
+        attempts++;
+        continue;
+      }
+      throw err; // For other errors like 404/400, throw immediately
+    }
+  }
+  throw new Error("Telah mencoba semua API key namun tetap terkena limit. Silakan tambahkan lebih banyak key.");
+}
+
+async function callGeminiMultimodalWithSDK({ apiKeys, userId, model: modelId, prompt, imageBuffer }) {
+  let startIndex = userRotationIndex.get(userId) || 0;
+  let attempts = 0;
+  const maxAttempts = apiKeys.length;
+
+  while (attempts < maxAttempts) {
+    const currentIndex = (startIndex + attempts) % apiKeys.length;
+    const apiKey = apiKeys[currentIndex];
+    userRotationIndex.set(userId, (currentIndex + 1) % apiKeys.length);
+
+    try {
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ model: modelId });
+      
+      const result = await model.generateContent([
+        prompt,
+        {
+          inlineData: {
+            data: imageBuffer.toString("base64"),
+            mimeType: "image/jpeg"
+          }
+        }
+      ]);
+      const response = await result.response;
+      return response.text().trim();
+    } catch (err) {
+      console.error(`[SDK Multimodal] Attempt ${attempts} failed with Key ${currentIndex}: ${err.message}`);
+      if (err.message.includes("429") || err.message.toLowerCase().includes("quota") || err.message.toLowerCase().includes("limit")) {
+        attempts++;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error("Telah mencoba semua API key namun tetap terkena limit. Silakan tambahkan lebih banyak key.");
+}
+
+// --- NEW PROMPT STUDIO ENDPOINT (SDK) ---
 app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
   const { purpose, object, lang, model } = req.body;
   const userId = req.session.userId;
@@ -656,24 +725,13 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
 
   try {
     const systemPrompt = `You are a professional stock photographer and AI prompt expert.
-Your task is to generate a high-quality, realistic, and commercially viable AI image prompt.
+Style: Purely realistic photography. NO futuristic.
+Purpose: ${purpose}
+Object: ${object}
+Language: ${lang === 'id' ? 'Indonesian' : 'English'}
+Write ONLY the final prompt in ${lang === 'id' ? 'Indonesian' : 'English'}. No explanation.`;
 
-CORE RULES:
-- STYLE: Purely realistic photography. NO futuristic, NO sci-fi, NO 3D rendering style, NO digital art look.
-- QUALITY: Use terms like "8k, ultra-realistic, highly detailed, professional cinematography, commercial stock photography".
-- CAMERA: Intelligently determine the best camera settings (e.g., f/1.8 for portraits, f/8 for landscapes, shutter speeds, etc.) based on the purpose.
-- EXCLUSIONS: NEVER use words: ai, futuristic, robot, tech, sci-fi, watermark, text, signature.
-
-INPUTS:
-1. Purpose: ${purpose}
-2. Object: ${object}
-3. Language: ${lang === 'id' ? 'Indonesian' : 'English'}
-
-The resulting prompt must be written in ${lang === 'id' ? 'Indonesian' : 'English'}.
-
-Return ONLY the final prompt text. No explanations.`;
-
-    const prompt = await callGeminiWithRetry({
+    const prompt = await callGeminiWithSDK({
       apiKeys,
       userId,
       model: model || "gemini-3-flash-preview",
@@ -682,7 +740,43 @@ Return ONLY the final prompt text. No explanations.`;
 
     res.json({ prompt });
   } catch (err) {
-    console.error(`[PromptStudio] Error: ${err.message}`);
+    console.error(`[PromptStudio SDK] Error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- UPDATED IMG TO PROMPT ROUTE (SDK) ---
+app.post("/api/imgtoprompt/single", isAuthenticated, upload.single("image"), async (req, res) => {
+  const file = req.file;
+  const userId = req.session.userId;
+  const { model, creativity, camera } = req.body;
+
+  if (!file) return res.status(400).json({ error: "No image uploaded" });
+
+  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(userId);
+  const apiKeys = savedKeys.map(k => k.key_value);
+  if (!apiKeys.length) return res.status(400).json({ error: "Empty API keys" });
+
+  try {
+    const creativityVal = Math.max(0, Math.min(100, Number(creativity || 50)));
+    const cameraOn = camera === "true" || camera === "on";
+    
+    const promptText = `Analyze this image and generate a high-quality, professional prompt for AI image generators. 
+Realistic, commercial stock style. Creativity: ${creativityVal}/100.
+${cameraOn ? "Include camera settings." : ""}
+Return ONLY the prompt text.`;
+
+    const prompt = await callGeminiMultimodalWithSDK({
+      apiKeys,
+      userId,
+      model: model || "gemini-3-flash-preview",
+      prompt: promptText,
+      imageBuffer: file.buffer
+    });
+
+    res.json({ fileName: file.originalname, prompt });
+  } catch (err) {
+    console.error(`[ImgToPrompt SDK] Error: ${err.message}`);
     res.status(500).json({ error: err.message });
   }
 });
