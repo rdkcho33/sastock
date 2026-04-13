@@ -314,11 +314,19 @@ Create output in valid JSON ONLY, with these fields:
 }
 
 function parseResponseText(text) {
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) return null;
+  if (!text) return null;
   try {
-    return JSON.parse(jsonMatch[0]);
-  } catch (error) {
+    // Robust extraction: find the first '{' and the last '}'
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1 || end < start) {
+        console.warn("[Parser] No JSON object found in text.");
+        return null;
+    }
+    const jsonStr = text.substring(start, end + 1);
+    return JSON.parse(jsonStr);
+  } catch (err) {
+    console.error(`[Parser] JSON Parse Error: ${err.message}. Raw: ${text.substring(0, 150)}...`);
     return null;
   }
 }
@@ -470,6 +478,7 @@ async function callGeminiWithRetry({ apiKeys, userId, model, prompt, visualPart 
 }
 
 app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (req, res) => {
+  console.log(`[Metadata] Starting generation for ${req.files?.length || 0} files. User: ${req.session.userId}`);
   const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(req.session.userId);
   const apiKeys = savedKeys.map(k => k.key_value);
 
@@ -509,6 +518,7 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
 
     try {
       const prompt = buildPrompt({ ...file, ext }, options);
+      console.log(`[Metadata] Processing: ${file.originalname}...`);
       const visualPart = await getVisualPart(file);
       const result = await callGeminiWithRetry({
         apiKeys,
@@ -529,166 +539,13 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
     }
     items.push(entry);
   }
+  console.log(`[Metadata] Finished processing ${items.length} files.`);
   res.json({ items });
 });
 
-// --- TEXT ONLY GENERATION HELPER ---
-async function callGeminiTextOnlyWithRetry({ apiKeys, userId, model, prompt }) {
-  let startIndex = userRotationIndex.get(userId) || 0;
-  let attempts = 0;
-  const maxAttempts = apiKeys.length;
 
-  while (attempts < maxAttempts) {
-    const currentIndex = (startIndex + attempts) % apiKeys.length;
-    const apiKey = apiKeys[currentIndex];
-    userRotationIndex.set(userId, (currentIndex + 1) % apiKeys.length);
 
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${apiKey}`;
-      const body = {
-        contents: [{ parts: [{ text: prompt }] }]
-      };
-
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-
-      if (response.status === 429) {
-        attempts++;
-        continue;
-      }
-
-      if (!response.ok) {
-        const payload = await response.text();
-        throw new Error(`Gemini failed: ${response.status} ${payload}`);
-      }
-
-      const data = await response.json();
-      return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    } catch (err) {
-      if (attempts === maxAttempts - 1) throw err;
-      attempts++;
-    }
-  }
-  throw new Error("All API keys reached their rate limit.");
-}
-
-// --- PROMPT STUDIO HELPERS ---
-function normalizeText(s) {
-  return (s || "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[^\p{L}\p{N}\s]/gu, "")
-    .trim();
-}
-
-function jaccardSimilarity(a, b) {
-  const A = new Set(normalizeText(a).split(" ").filter(Boolean));
-  const B = new Set(normalizeText(b).split(" ").filter(Boolean));
-  if (A.size === 0 || B.size === 0) return 0;
-  let inter = 0;
-  for (const w of A) if (B.has(w)) inter++;
-  const union = A.size + B.size - inter;
-  return union === 0 ? 0 : inter / union;
-}
-
-function isTooSimilar(existingPrompts, candidatePrompt) {
-  const c = normalizeText(candidatePrompt);
-  if (!c) return true;
-  for (const p of existingPrompts) {
-    const pn = normalizeText(p);
-    if (!pn) continue;
-    if (pn === c) return true;
-    if (jaccardSimilarity(pn, c) >= 0.85) return true;
-  }
-  return false;
-}
-
-function buildStudioInstruction(payload) {
-  const { mode, tujuan, objek, ekspresi, aktivitas, background, count, language } = payload;
-  const n = Math.max(1, Math.min(20, Number(count || 1)));
-  const targetLang = language === "English" ? "English" : "Bahasa Indonesia";
-
-  return `Anda adalah "AI Prompt Studio" profesional.
-Buat instruksi visual yang sangat mendetail untuk generator gambar AI (seperti Midjourney atau DALL-E 3) yang dioptimalkan untuk Microstock.
-
-Output dalam bahasa: ${targetLang}.
-
-Template:
-Foto [Tujuan] yang menampilkan [Objek] dengan [Ekspresi], sedang [Aktivitas], berlatar [Background].
-
-Aturan:
-- Mode=AUTO: Kembangkan ekspresi/aktivitas/background secara kreatif.
-- Mode=MANUAL: Gunakan nilai dari user secara presisi.
-
-Batching:
-- Buat tepat ${n} unik prompt.
-- Variasi framing, pencahayaan, dan sudut kamera.
-
-Output:
-HANYA JSON VALID:
-{
-  "results": [
-    { "prompt": "..." }
-  ]
-}
-
-DATA:
-Mode: ${mode}
-Tujuan: ${tujuan}
-Objek: ${objek}
-Ekspresi: ${ekspresi || "N/A"}
-Aktivitas: ${aktivitas || "N/A"}
-Background: ${background || "N/A"}
-`;
-}
-
-app.post("/api/prompt-studio", isAuthenticated, async (req, res) => {
-  const { mode, tujuan, objek, ekspresi, aktivitas, background, count, model } = req.body;
-  const targetCount = Math.max(1, Math.min(20, Number(count || 1)));
-
-  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(req.session.userId);
-  const apiKeys = savedKeys.map(k => k.key_value);
-  if (!apiKeys.length) return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
-
-  const collected = [];
-  const collectedPrompts = [];
-  const maxRounds = 3;
-
-  try {
-    for (let round = 1; round <= maxRounds; round++) {
-      const need = targetCount - collected.length;
-      if (need <= 0) break;
-
-      const instruction = buildStudioInstruction({ ...req.body, count: need });
-      const rawResponse = await callGeminiTextOnlyWithRetry({
-        apiKeys,
-        userId: req.session.userId,
-        model: model || "gemini-3-flash-preview",
-        prompt: instruction
-      });
-
-      const parsed = parseResponseText(rawResponse);
-      const batch = parsed?.results;
-      if (!Array.isArray(batch)) continue;
-
-      for (const item of batch) {
-        if (!item.prompt_final) continue;
-        if (!isTooSimilar(collectedPrompts, item.prompt_final)) {
-          collected.push(item);
-          collectedPrompts.push(item.prompt_final);
-          if (collected.length >= targetCount) break;
-        }
-      }
-    }
-    res.json({ results: collected });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
+// --- HEALTH CHECK ---
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
@@ -702,6 +559,7 @@ app.listen(PORT, () => {
 // --- IMG TO PROMPT ROUTE ---
 
 app.post("/api/imgtoprompt", isAuthenticated, upload.array("images", 100), async (req, res) => {
+  console.log(`[ImgToPrompt] Starting for ${req.files?.length || 0} images. User: ${req.session.userId}`);
   const images = req.files || [];
   const model = req.body.model || "gemini-3-flash-preview";
   const creativity = Math.max(0, Math.min(100, Number(req.body.creativity || 50)));

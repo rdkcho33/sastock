@@ -18,6 +18,52 @@ const copyAllBtn = document.getElementById("copyAllBtn");
 const resultsGrid = document.getElementById("resultsGrid");
 const fileCountLabel = document.getElementById("fileCount");
 
+// --- LOG CONSOLE UTILITY ---
+const logConsole = document.getElementById("logConsole");
+const logBody = document.getElementById("logBody");
+const toggleLogBtn = document.getElementById("toggleLogBtn");
+const clearLogBtn = document.getElementById("clearLogBtn");
+
+function logToConsole(message, type = "info") {
+  if (!logBody) return; // Defensive check
+  const entry = document.createElement("div");
+  const time = new Date().toLocaleTimeString();
+  entry.className = `log-entry ${type}`;
+  entry.textContent = `[${time}] ${message}`;
+  logBody.appendChild(entry);
+  logBody.scrollTop = logBody.scrollHeight;
+  
+  if (type === "error") console.error(`[LOG] ${message}`);
+  else console.log(`[LOG] ${message}`);
+}
+
+if (toggleLogBtn && logConsole) {
+    toggleLogBtn.onclick = (e) => {
+      e.stopPropagation();
+      logConsole.classList.toggle("minimized");
+      const icon = toggleLogBtn.querySelector("svg");
+      if (logConsole.classList.contains("minimized")) {
+        icon.innerHTML = '<polyline points="18 15 12 21 6 15"></polyline>';
+      } else {
+        icon.innerHTML = '<polyline points="18 15 12 9 6 15"></polyline>';
+      }
+    };
+}
+
+if (clearLogBtn && logBody) {
+    clearLogBtn.onclick = (e) => {
+      e.stopPropagation();
+      logBody.innerHTML = '<div class="log-entry system">Logs cleared.</div>';
+    };
+}
+
+const logHeader = document.querySelector(".log-header");
+if (logHeader && logConsole) {
+    logHeader.onclick = () => {
+        logConsole.classList.toggle("minimized");
+    };
+}
+
 async function init() {
   const auth = await checkAuth();
   if (!auth.authenticated) {
@@ -62,6 +108,10 @@ function addFiles(newFiles) {
     return f.type.startsWith("image/") || ext === "svg" || ext === "eps";
   });
 
+  if (images.length > 0) {
+    logToConsole(`Added ${images.length} images to queue.`, "info");
+  }
+
   images.forEach(f => {
     const ext = f.name.split('.').pop().toLowerCase();
     const isVector = ext === 'svg' || ext === 'eps';
@@ -82,6 +132,7 @@ function addFiles(newFiles) {
 }
 
 async function processVectorFile(fileItem) {
+  logToConsole(`Converting vector: ${fileItem.file.name}...`, "info");
   const formData = new FormData();
   formData.append("file", fileItem.file);
 
@@ -94,8 +145,10 @@ async function processVectorFile(fileItem) {
     const data = await res.json();
     fileItem.previewUrl = `data:image/png;base64,${data.png}`;
     fileItem.status = "pending";
+    logToConsole(`Vector converted: ${fileItem.file.name}`, "success");
   } catch (err) {
     fileItem.status = "failed";
+    logToConsole(`Vector failed: ${fileItem.file.name} - ${err.message}`, "error");
     console.error(err);
   } finally {
     renderPendingCards();
@@ -166,6 +219,8 @@ runBtn.onclick = async () => {
   runBtn.innerHTML = "Processing...";
   resultsGrid.innerHTML = "";
   copyAllBtn.style.display = "none";
+  
+  logToConsole(`Analyzing ${state.files.length} images...`, "info");
 
   const formData = new FormData();
   state.files.forEach(f => formData.append("images", f.file));
@@ -186,6 +241,8 @@ runBtn.onclick = async () => {
 
     const data = await res.json();
     state.results = data.results;
+    const successCount = (data.results || []).filter(r => !r.error).length;
+    logToConsole(`Finished! Generated ${successCount} prompts successfully.`, "success");
     renderResults(data.results);
     
     // Show copy all button if we have results
@@ -193,6 +250,7 @@ runBtn.onclick = async () => {
       copyAllBtn.style.display = "inline-block";
     }
   } catch (err) {
+    logToConsole(`Error: ${err.message}`, "error");
     alert(err.message);
   } finally {
     runBtn.disabled = false;
