@@ -642,11 +642,6 @@ Aktivitas: ${aktivitas || "N/A"}
 Background: ${background || "N/A"}
 `;
 }
-Ekspresi: ${ekspresi || ""}
-Aktivitas: ${aktivitas || ""}
-Background: ${background || ""}
-`;
-}
 
 app.post("/api/prompt-studio", isAuthenticated, async (req, res) => {
   const { mode, tujuan, objek, ekspresi, aktivitas, background, count, model } = req.body;
