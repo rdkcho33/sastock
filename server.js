@@ -20,6 +20,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const app = express();
 
+const GHOSTSCRIPT_BIN =
+  process.env.GHOSTSCRIPT_BIN ||
+  (process.platform === "win32" ? "gswin64c" : "gs");
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
@@ -42,6 +46,10 @@ app.use(
 );
 
 app.use(express.static(path.join(__dirname, "public")));
+
+function buildGhostscriptPngCommand(inputPath, outputPath) {
+  return `${GHOSTSCRIPT_BIN} -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT -dEPSCrop -sDEVICE=png16m -r300 -sOutputFile="${outputPath}" "${inputPath}"`;
+}
 
 // Auth Middleware
 const isAuthenticated = (req, res, next) => {
@@ -212,9 +220,9 @@ app.post("/api/convert-vector", isAuthenticated, upload.single("file"), async (r
       
       await fs.writeFile(tempIn, file.buffer);
       
-      // Use gswin64c - Windows Ghostscript
+      // Use Ghostscript to rasterize EPS before previewing in the UI.
       try {
-        await execPromise(`gswin64c -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT -sDEVICE=png16m -r300 -sOutputFile="${tempOut}" "${tempIn}"`);
+        await execPromise(buildGhostscriptPngCommand(tempIn, tempOut));
         const pngBuffer = await fs.readFile(tempOut);
         
         // Cleanup temp files
@@ -224,7 +232,7 @@ app.post("/api/convert-vector", isAuthenticated, upload.single("file"), async (r
         return res.json({ png: pngBuffer.toString("base64") });
       } catch (gsError) {
         await fs.unlink(tempIn).catch(() => {});
-        throw gsError;
+        throw new Error(`Ghostscript EPS conversion failed using "${GHOSTSCRIPT_BIN}": ${gsError.message}`);
       }
     }
 
@@ -547,7 +555,7 @@ async function getVisualPart(file) {
       const tempOut = path.join(__dirname, `gen_temp_${Date.now()}.png`);
       await fs.writeFile(tempIn, file.buffer);
       try {
-        await execPromise(`gswin64c -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT -sDEVICE=png16m -r300 -sOutputFile="${tempOut}" "${tempIn}"`);
+        await execPromise(buildGhostscriptPngCommand(tempIn, tempOut));
         const pngBuffer = await fs.readFile(tempOut);
         await fs.unlink(tempIn).catch(() => {});
         await fs.unlink(tempOut).catch(() => {});
@@ -559,7 +567,7 @@ async function getVisualPart(file) {
         };
       } catch (gsError) {
         await fs.unlink(tempIn).catch(() => {});
-        throw gsError;
+        throw new Error(`Ghostscript EPS conversion failed using "${GHOSTSCRIPT_BIN}": ${gsError.message}`);
       }
     }
 

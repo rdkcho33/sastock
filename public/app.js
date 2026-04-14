@@ -563,11 +563,21 @@ async function processVectorFile(fileItem) {
       method: "POST",
       body: formData
     });
-    
-    if (!res.ok) throw new Error("Conversion failed");
-    
+
     const contentType = res.headers.get("content-type") || "";
     const raw = await res.text();
+    if (!res.ok) {
+      if (contentType.includes("application/json")) {
+        try {
+          const data = JSON.parse(raw);
+          throw new Error(data.error || "Conversion failed");
+        } catch (parseError) {
+          throw new Error(raw.slice(0, 200) || "Conversion failed");
+        }
+      }
+      throw new Error(raw.slice(0, 200) || "Conversion failed");
+    }
+
     if (!contentType.includes("application/json")) {
       throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
     }
