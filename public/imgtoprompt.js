@@ -3,7 +3,10 @@
 const state = {
   user: null,
   files: [],
-  results: []
+  results: [],
+  isRunning: false,
+  stopRequested: false,
+  activeController: null
 };
 
 // Elements
@@ -13,6 +16,7 @@ const creativitySlider = document.getElementById("creativitySlider");
 const creativityValue = document.getElementById("creativityValue");
 const cameraSwitch = document.getElementById("cameraSwitch");
 const runBtn = document.getElementById("runBtn");
+const stopBtn = document.getElementById("stopBtn");
 const clearBtn = document.getElementById("clearBtn");
 const copyAllBtn = document.getElementById("copyAllBtn");
 const resultsGrid = document.getElementById("resultsGrid");
@@ -168,8 +172,12 @@ async function processVectorFile(fileItem) {
 
 function checkConvertingState() {
   const isAnyConverting = state.files.some(f => f.status === "converting");
-  runBtn.disabled = isAnyConverting || state.files.length === 0;
-  if (isAnyConverting) {
+  runBtn.disabled = state.isRunning || isAnyConverting || state.files.length === 0;
+  stopBtn.style.display = state.isRunning ? "inline-flex" : "none";
+  stopBtn.disabled = !state.isRunning;
+  if (state.isRunning) {
+    runBtn.innerHTML = "Processing Queue...";
+  } else if (isAnyConverting) {
     runBtn.innerHTML = "Processing Vectors...";
   } else {
     runBtn.innerHTML = "Generate All Prompts";
@@ -179,6 +187,7 @@ function checkConvertingState() {
 function updateUI() {
   fileCountLabel.textContent = `${state.files.length} images selected`;
   renderPendingCards();
+  checkConvertingState();
 }
 
 function renderPendingCards() {
@@ -211,6 +220,7 @@ window.removeFile = (index) => {
 };
 
 clearBtn.onclick = () => {
+  if (state.isRunning) return;
   state.files = [];
   state.results = [];
   resultsGrid.innerHTML = "";
@@ -224,34 +234,39 @@ creativitySlider.oninput = (e) => {
 
 runBtn.onclick = async () => {
   if (state.files.length === 0) return alert("Please select images first.");
-  
-  runBtn.disabled = true;
-  runBtn.innerHTML = "Processing Queue...";
+
+  state.isRunning = true;
+  state.stopRequested = false;
+  state.activeController = new AbortController();
   resultsGrid.innerHTML = "";
   state.results = [];
   copyAllBtn.style.display = "none";
+  clearBtn.disabled = true;
+  checkConvertingState();
   
   logToConsole(`Starting batch process for ${state.files.length} images...`, "info");
 
-  for (let i = 0; i < state.files.length; i++) {
-    const fileItem = state.files[i];
-    
-    // Create a mini-log for this image
-    logToConsole(`[${i+1}/${state.files.length}] Processing: ${fileItem.file.name}`, "info");
+  try {
+    for (let i = 0; i < state.files.length; i++) {
+      if (state.stopRequested) break;
 
-    const formData = new FormData();
-    formData.append("image", fileItem.file);
-    formData.append("model", document.getElementById("modelSelect").value);
-    formData.append("creativity", creativitySlider.value);
-    formData.append("camera", cameraSwitch.checked ? "on" : "off");
+      const fileItem = state.files[i];
+      logToConsole(`[${i+1}/${state.files.length}] Processing: ${fileItem.file.name}`, "info");
 
-    try {
-      const res = await fetch("/api/imgtoprompt/single", {
-        method: "POST",
-        body: formData
-      });
-      
-      if (!res.ok) {
+      const formData = new FormData();
+      formData.append("image", fileItem.file);
+      formData.append("model", document.getElementById("modelSelect").value);
+      formData.append("creativity", creativitySlider.value);
+      formData.append("camera", cameraSwitch.checked ? "on" : "off");
+
+      try {
+        const res = await fetch("/api/imgtoprompt/single", {
+          method: "POST",
+          body: formData,
+          signal: state.activeController.signal
+        });
+        
+        if (!res.ok) {
           const contentType = res.headers.get("content-type") || "";
           const raw = await res.text();
           if (!contentType.includes("application/json")) {
@@ -259,36 +274,70 @@ runBtn.onclick = async () => {
           }
           const errData = JSON.parse(raw);
           throw new Error(errData.error || "Failed");
-      }
+        }
 
-      const contentType = res.headers.get("content-type") || "";
-      const raw = await res.text();
-      if (!contentType.includes("application/json")) {
-        throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+        const contentType = res.headers.get("content-type") || "";
+        const raw = await res.text();
+        if (!contentType.includes("application/json")) {
+          throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+        }
+        const data = JSON.parse(raw);
+        state.results.push({ fileName: fileItem.file.name, prompt: data.prompt, error: null });
+        logToConsole(`[${i+1}/${state.files.length}] Success: ${fileItem.file.name}`, "success");
+      } catch (err) {
+        if (err.name === "AbortError" || state.stopRequested) {
+          break;
+        }
+
+        logToConsole(`[${i+1}/${state.files.length}] Failed: ${fileItem.file.name} - ${err.message}`, "error");
+        state.results.push({ fileName: fileItem.file.name, prompt: "", error: err.message });
       }
-      const data = JSON.parse(raw);
-      state.results.push({ fileName: fileItem.file.name, prompt: data.prompt, error: null });
-      logToConsole(`[${i+1}/${state.files.length}] Success: ${fileItem.file.name}`, "success");
-    } catch (err) {
-      logToConsole(`[${i+1}/${state.files.length}] Failed: ${fileItem.file.name} - ${err.message}`, "error");
-      state.results.push({ fileName: fileItem.file.name, prompt: "", error: err.message });
+      
+      renderResults(state.results);
+
+      if (!state.stopRequested && i < state.files.length - 1) {
+        await new Promise(r => setTimeout(r, 2000));
+      }
     }
-    
-    // Render results immediately after each image is done
-    renderResults(state.results);
-    
-    // Set 2 second delay to avoid Gemini rate limits
-    await new Promise(r => setTimeout(r, 2000));
+
+    if (state.stopRequested) {
+      logToConsole("Img To Prompt process stopped by user.", "system");
+    } else {
+      const successCount = state.results.filter(r => !r.error).length;
+      logToConsole(`Batch finished! ${successCount}/${state.files.length} successful.`, "success");
+
+      if (successCount > 0) {
+        copyAllBtn.style.display = "inline-block";
+      }
+    }
+  } finally {
+    state.isRunning = false;
+    state.stopRequested = false;
+    state.activeController = null;
+    clearBtn.disabled = false;
+    checkConvertingState();
+  }
+};
+
+stopBtn.onclick = async () => {
+  if (!state.isRunning) return;
+
+  state.stopRequested = true;
+  stopBtn.disabled = true;
+  logToConsole("Stopping Img To Prompt process...", "system");
+
+  if (state.activeController) {
+    state.activeController.abort();
   }
 
-  runBtn.disabled = false;
-  runBtn.innerHTML = "Generate All Prompts";
-  
-  const successCount = state.results.filter(r => !r.error).length;
-  logToConsole(`Batch finished! ${successCount}/${state.files.length} successful.`, "success");
-  
-  if (successCount > 0) {
-    copyAllBtn.style.display = "inline-block";
+  try {
+    await fetch("/api/process-control/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool: "imgtoprompt" })
+    });
+  } catch (error) {
+    console.warn("Failed to notify server to stop imgtoprompt process:", error);
   }
 };
 

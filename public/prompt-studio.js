@@ -3,7 +3,9 @@ const state = {
   lang: "en",
   mode: "AUTO",
   results: [],
-  isGenerating: false
+  isGenerating: false,
+  stopRequested: false,
+  activeController: null
 };
 
 const logBody = document.getElementById("logBody");
@@ -11,6 +13,7 @@ const toggleLogBtn = document.getElementById("toggleLogBtn");
 const clearLogBtn = document.getElementById("clearLogBtn");
 const logConsole = document.getElementById("logConsole");
 const generateBtn = document.getElementById("generateBtn");
+const stopBtn = document.getElementById("stopBtn");
 const resultsList = document.getElementById("resultsList");
 const copyAllBtn = document.getElementById("copyAllBtn");
 const clearBtn = document.getElementById("clearBtn");
@@ -172,12 +175,17 @@ generateBtn.onclick = async () => {
   }
 
   state.isGenerating = true;
+  state.stopRequested = false;
+  state.activeController = new AbortController();
   state.results = [];
   resultsList.innerHTML = "";
   copyAllBtn.style.display = "none";
 
   generateBtn.disabled = true;
   generateBtn.innerHTML = `<span>Generating batch of ${batchCount}...</span>`;
+  stopBtn.style.display = "block";
+  stopBtn.disabled = false;
+  clearBtn.disabled = true;
   logToConsole(`Requesting ${batchCount} prompts in ${state.mode} mode...`, "info");
 
   const cardIds = [];
@@ -191,6 +199,7 @@ generateBtn.onclick = async () => {
     const response = await fetch("/api/prompt-studio/generate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
+      signal: state.activeController.signal,
       body: JSON.stringify({
         mode: state.mode,
         purpose,
@@ -234,13 +243,44 @@ generateBtn.onclick = async () => {
 
     logToConsole(`Successfully generated ${prompts.length} prompts.`, "success");
   } catch (err) {
-    cardIds.forEach((id) => updateCardError(id, err.message));
-    logToConsole(`Batch failed: ${err.message}`, "error");
+    if (err.name === "AbortError" || state.stopRequested) {
+      cardIds.forEach((id) => updateCardError(id, "Process stopped by user."));
+      logToConsole("Prompt Studio process stopped by user.", "system");
+    } else {
+      cardIds.forEach((id) => updateCardError(id, err.message));
+      logToConsole(`Batch failed: ${err.message}`, "error");
+    }
   }
 
   state.isGenerating = false;
+  state.stopRequested = false;
+  state.activeController = null;
   generateBtn.disabled = false;
   generateBtn.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:8px;"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"></path><path d="M5 3v4"></path><path d="M19 17v4"></path><path d="M3 5h4"></path><path d="M17 19h4"></path></svg> Generate Stock Prompts`;
+  stopBtn.style.display = "none";
+  clearBtn.disabled = false;
+};
+
+stopBtn.onclick = async () => {
+  if (!state.isGenerating) return;
+
+  state.stopRequested = true;
+  stopBtn.disabled = true;
+  logToConsole("Stopping Prompt Studio process...", "system");
+
+  if (state.activeController) {
+    state.activeController.abort();
+  }
+
+  try {
+    await fetch("/api/process-control/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool: "prompt-studio" })
+    });
+  } catch (error) {
+    console.warn("Failed to notify server to stop prompt studio process:", error);
+  }
 };
 
 window.copyCardPrompt = (button) => {
@@ -256,7 +296,7 @@ window.copyCardPrompt = (button) => {
 };
 
 copyAllBtn.onclick = () => {
-  const allText = state.results.join("\n");
+  const allText = state.results.join("\n\n");
   navigator.clipboard.writeText(allText);
   const original = copyAllBtn.innerText;
   copyAllBtn.innerText = "All Copied!";
@@ -268,6 +308,7 @@ copyAllBtn.onclick = () => {
 };
 
 clearBtn.onclick = () => {
+  if (state.isGenerating) return;
   resultsList.innerHTML = "";
   state.results = [];
   copyAllBtn.style.display = "none";

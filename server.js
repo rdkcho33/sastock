@@ -1,5 +1,4 @@
 import express from "express";
-import { GoogleGenerativeAI } from "@google/generative-ai";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -113,8 +112,82 @@ app.get("/api/auth/me", (req, res) => {
 });
 
 // --- ROTATION STATE ---
-// Keeps track of the last used key index per user to ensure Round Robin across requests
+// Keeps track of the active key index per user.
+// A key stays active until it hits limit/invalid, then moves to the next one.
 const userRotationIndex = new Map();
+const userProcessControllers = new Map();
+
+function getProcessStateKey(userId, tool) {
+  return `${userId}:${tool}`;
+}
+
+function createStopError(message = "Proses dihentikan oleh pengguna.") {
+  const error = new Error(message);
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortLikeError(error) {
+  if (!error) return false;
+  if (error.name === "AbortError") return true;
+
+  const message = String(error.message || "").toLowerCase();
+  return message.includes("aborted") || message.includes("dihentikan");
+}
+
+function assertProcessActive(signal) {
+  if (!signal?.aborted) return;
+
+  const reason = signal.reason;
+  if (reason instanceof Error) throw reason;
+  throw createStopError();
+}
+
+function startUserProcess(userId, tool) {
+  const processKey = getProcessStateKey(userId, tool);
+  const current = userProcessControllers.get(processKey);
+
+  if (current?.controller) {
+    current.controller.abort(createStopError("Proses sebelumnya digantikan oleh proses baru."));
+  }
+
+  const controller = new AbortController();
+  userProcessControllers.set(processKey, { controller, startedAt: Date.now() });
+  return controller;
+}
+
+function finishUserProcess(userId, tool, controller) {
+  const processKey = getProcessStateKey(userId, tool);
+  const current = userProcessControllers.get(processKey);
+  if (current?.controller === controller) {
+    userProcessControllers.delete(processKey);
+  }
+}
+
+function getNormalizedRotationIndex(userId, totalKeys) {
+  if (!totalKeys) return 0;
+  const rawIndex = Number(userRotationIndex.get(userId) || 0);
+  if (!Number.isFinite(rawIndex) || rawIndex < 0) return 0;
+  return rawIndex % totalKeys;
+}
+
+function setRotationIndex(userId, index, totalKeys) {
+  if (!totalKeys) {
+    userRotationIndex.set(userId, 0);
+    return;
+  }
+
+  const normalized = ((Number(index) || 0) % totalKeys + totalKeys) % totalKeys;
+  userRotationIndex.set(userId, normalized);
+}
+
+function getUserApiKeys(userId) {
+  return db
+    .prepare("SELECT key_value FROM api_keys WHERE user_id = ? ORDER BY id ASC")
+    .all(userId)
+    .map((item) => String(item.key_value || "").trim())
+    .filter(Boolean);
+}
 
 
 
@@ -165,7 +238,9 @@ app.post("/api/convert-vector", isAuthenticated, upload.single("file"), async (r
 // --- KEY MANAGEMENT ROUTES ---
 
 app.get("/api/keys", isAuthenticated, (req, res) => {
-  const keys = db.prepare("SELECT id, key_value, label FROM api_keys WHERE user_id = ?").all(req.session.userId);
+  const keys = db
+    .prepare("SELECT id, key_value, label FROM api_keys WHERE user_id = ? ORDER BY id ASC")
+    .all(req.session.userId);
   res.json({ keys });
 });
 
@@ -200,6 +275,24 @@ app.delete("/api/keys/:id", isAuthenticated, (req, res) => {
   const stmt = db.prepare("DELETE FROM api_keys WHERE id = ? AND user_id = ?");
   stmt.run(req.params.id, req.session.userId);
   res.json({ success: true });
+});
+
+app.post("/api/process-control/stop", isAuthenticated, (req, res) => {
+  const tool = String(req.body?.tool || "").trim();
+  if (!tool) {
+    return res.status(400).json({ error: "Tool wajib diisi." });
+  }
+
+  const processKey = getProcessStateKey(req.session.userId, tool);
+  const current = userProcessControllers.get(processKey);
+
+  if (current?.controller) {
+    current.controller.abort(createStopError());
+    userProcessControllers.delete(processKey);
+    return res.json({ success: true, stopped: true });
+  }
+
+  res.json({ success: true, stopped: false });
 });
 
 // --- ADMIN ROUTES ---
@@ -518,64 +611,117 @@ async function getVisualPart(file) {
   return null;
 }
 
-async function callGeminiWithRetry({ apiKeys, userId, model, prompt, visualPart }) {
-  let startIndex = userRotationIndex.get(userId) || 0;
-  let attempts = 0;
-  const maxAttempts = apiKeys.length;
+async function callGeminiWithRotation({
+  apiKeys,
+  userId,
+  model,
+  parts,
+  generationConfig = {},
+  signal
+}) {
+  const totalKeys = apiKeys.length;
+  if (!totalKeys) {
+    throw new Error("Masukkan minimal satu API key Gemini.");
+  }
 
-  while (attempts < maxAttempts) {
-    const currentIndex = (startIndex + attempts) % apiKeys.length;
-    const apiKey = apiKeys[currentIndex];
-    userRotationIndex.set(userId, (currentIndex + 1) % apiKeys.length);
+  let currentIndex = getNormalizedRotationIndex(userId, totalKeys);
+  let attempts = 0;
+  let lastErrorText = "";
+
+  while (attempts < totalKeys) {
+    assertProcessActive(signal);
+
+    const activeIndex = currentIndex % totalKeys;
+    const apiKey = apiKeys[activeIndex];
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${apiKey}`;
-      const parts = [{ text: prompt }];
-      if (visualPart) parts.push(visualPart);
-
       const response = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ contents: [{ parts }] })
+        signal,
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig
+        })
       });
 
-      if (response.status === 429) {
-        attempts++;
-        continue;
-      }
+      const rawText = await response.text();
+      lastErrorText = rawText;
 
       if (!response.ok) {
-        const payload = await response.text();
-        throw new Error(`Gemini failed: ${response.status} ${payload}`);
+        if (isLimitError(response.status, rawText) || isInvalidKeyError(response.status, rawText)) {
+          attempts += 1;
+          currentIndex = (activeIndex + 1) % totalKeys;
+          setRotationIndex(userId, currentIndex, totalKeys);
+          continue;
+        }
+
+        throw new Error(`Gemini failed: ${response.status} ${truncateText(rawText)}`);
       }
 
-      const data = await response.json();
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      const parsed = parseResponseText(text);
+      const parsedResponse = JSON.parse(rawText);
+      const outputText =
+        parsedResponse?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim() || "";
 
-      if (!parsed || !parsed.title || !parsed.description || !Array.isArray(parsed.keywords)) {
-        throw new Error(`Invalid JSON format from AI`);
+      // Keep using the same key until it reaches limit.
+      setRotationIndex(userId, activeIndex, totalKeys);
+      return { text: outputText, keyIndex: activeIndex };
+    } catch (error) {
+      if (isAbortLikeError(error)) {
+        throw createStopError();
       }
 
-      return {
-        title: parsed.title.trim(),
-        description: parsed.description.trim().slice(0, 150),
-        keywords: parsed.keywords.map((v) => String(v).trim()).filter(Boolean),
-        categoryAdobe: parsed.categoryAdobe || 1,
-        categoryShutterstock: parsed.categoryShutterstock || "People"
-      };
-    } catch (err) {
-      if (attempts === maxAttempts - 1) throw err;
-      attempts++;
+      if (attempts === totalKeys - 1) {
+        throw error;
+      }
+
+      attempts += 1;
+      currentIndex = (activeIndex + 1) % totalKeys;
+      setRotationIndex(userId, currentIndex, totalKeys);
     }
   }
-  throw new Error("All API keys reached their rate limit.");
+
+  throw new Error(`Semua API key gagal dipakai. Terakhir: ${truncateText(lastErrorText)}`);
+}
+
+async function callGeminiWithRetry({ apiKeys, userId, model, prompt, visualPart, signal }) {
+  const parts = [{ text: prompt }];
+  if (visualPart) {
+    parts.push({
+      inlineData: {
+        mimeType: visualPart.inline_data?.mime_type || "image/jpeg",
+        data: visualPart.inline_data?.data || ""
+      }
+    });
+  }
+
+  const { text } = await callGeminiWithRotation({
+    apiKeys,
+    userId,
+    model,
+    parts,
+    signal
+  });
+
+  const parsed = parseResponseText(text);
+  if (!parsed || !parsed.title || !parsed.description || !Array.isArray(parsed.keywords)) {
+    throw new Error("Invalid JSON format from AI");
+  }
+
+  return {
+    title: parsed.title.trim(),
+    description: parsed.description.trim().slice(0, 150),
+    keywords: parsed.keywords.map((value) => String(value).trim()).filter(Boolean),
+    categoryAdobe: parsed.categoryAdobe || 1,
+    categoryShutterstock: parsed.categoryShutterstock || "People"
+  };
 }
 
 app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (req, res) => {
   console.log(`[Metadata] Starting generation for ${req.files?.length || 0} files. User: ${req.session.userId}`);
-  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(req.session.userId);
-  const apiKeys = savedKeys.map(k => k.key_value);
+  const userId = req.session.userId;
+  const apiKeys = getUserApiKeys(userId);
 
   const model = req.body.model || "gemini-3-flash-preview";
   const titleLength = Number(req.body.titleLength ?? 80);
@@ -599,43 +745,66 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: "Unggah minimal satu file." });
 
-  const items = [];
-  for (const file of files) {
-    const ext = path.extname(file.originalname).toLowerCase().replace(".", "");
-    const entry = {
-      fileName: file.originalname,
-      status: "pending",
-      title: "",
-      description: "",
-      keywords: [],
-      error: null
-    };
+  console.log(`[Metadata] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length)}.`);
+  const processController = startUserProcess(userId, "metadata");
+  const { signal } = processController;
 
-    try {
-      const prompt = buildPrompt({ ...file, ext }, options);
-      console.log(`[Metadata] Processing: ${file.originalname}...`);
-      const visualPart = await getVisualPart(file);
-      const result = await callGeminiWithRetry({
-        apiKeys,
-        userId: req.session.userId,
-        model,
-        prompt,
-        visualPart
-      });
-      entry.title = result.title;
-      entry.description = result.description;
-      entry.keywords = result.keywords;
-      entry.adobeCategory = result.categoryAdobe;
-      entry.shutterstockCategory = result.categoryShutterstock;
-      entry.status = "done";
-    } catch (error) {
-      entry.status = "failed";
-      entry.error = error.message;
+  try {
+    const items = [];
+    for (const file of files) {
+      assertProcessActive(signal);
+
+      const ext = path.extname(file.originalname).toLowerCase().replace(".", "");
+      const entry = {
+        fileName: file.originalname,
+        status: "pending",
+        title: "",
+        description: "",
+        keywords: [],
+        error: null
+      };
+
+      try {
+        const prompt = buildPrompt({ ...file, ext }, options);
+        console.log(`[Metadata] Processing: ${file.originalname}...`);
+        const visualPart = await getVisualPart(file);
+        const result = await callGeminiWithRetry({
+          apiKeys,
+          userId,
+          model,
+          prompt,
+          visualPart,
+          signal
+        });
+        entry.title = result.title;
+        entry.description = result.description;
+        entry.keywords = result.keywords;
+        entry.categoryAdobe = result.categoryAdobe;
+        entry.categoryShutterstock = result.categoryShutterstock;
+        entry.status = "done";
+      } catch (error) {
+        if (isAbortLikeError(error)) {
+          throw error;
+        }
+
+        entry.status = "failed";
+        entry.error = error.message;
+      }
+
+      items.push(entry);
     }
-    items.push(entry);
+
+    console.log(`[Metadata] Finished processing ${items.length} files.`);
+    return res.json({ items });
+  } catch (error) {
+    if (isAbortLikeError(error)) {
+      return res.status(409).json({ error: "Proses metadata dihentikan oleh pengguna." });
+    }
+
+    throw error;
+  } finally {
+    finishUserProcess(userId, "metadata", processController);
   }
-  console.log(`[Metadata] Finished processing ${items.length} files.`);
-  res.json({ items });
 });
 
 
@@ -656,9 +825,8 @@ app.post("/api/imgtoprompt", isAuthenticated, upload.array("images", 100), async
   const model = req.body.model || "gemini-3-flash-preview";
   const creativity = Math.max(0, Math.min(100, Number(req.body.creativity || 50)));
   const camera = req.body.camera === "on";
-
-  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(req.session.userId);
-  const apiKeys = savedKeys.map(k => k.key_value);
+  const userId = req.session.userId;
+  const apiKeys = getUserApiKeys(userId);
   
   if (!apiKeys.length) return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
   if (!images.length) return res.status(400).json({ error: "Unggah minimal satu file gambar." });
@@ -676,179 +844,105 @@ ${camera ? "- Include professional camera settings (lens, lighting, aperture, et
 - Return ONLY the prompt text. No explanation or JSON.`;
   }
 
-  const results = [];
-  for (const file of images) {
-    try {
-      const promptText = buildImgPrompt();
-      const prompt = await callGeminiMultimodalWithSDK({
-        apiKeys,
-        userId: req.session.userId,
-        model,
-        prompt: promptText,
-        imageBuffer: file.buffer
-      });
-      results.push({ fileName: file.originalname, prompt, error: null });
-    } catch (err) {
-      results.push({ fileName: file.originalname, prompt: "", error: err.message });
+  console.log(`[ImgToPrompt] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length)}.`);
+  const processController = startUserProcess(userId, "imgtoprompt");
+  const { signal } = processController;
+
+  try {
+    const results = [];
+    for (const file of images) {
+      assertProcessActive(signal);
+
+      try {
+        const promptText = buildImgPrompt();
+        const prompt = await callGeminiMultimodalWithSDK({
+          apiKeys,
+          userId,
+          model,
+          prompt: promptText,
+          imageBuffer: file.buffer,
+          mimeType: file.mimetype,
+          signal
+        });
+        results.push({ fileName: file.originalname, prompt, error: null });
+      } catch (err) {
+        if (isAbortLikeError(err)) {
+          throw err;
+        }
+
+        results.push({ fileName: file.originalname, prompt: "", error: err.message });
+      }
     }
+
+    return res.json({ results });
+  } catch (error) {
+    if (isAbortLikeError(error)) {
+      return res.status(409).json({ error: "Proses Img To Prompt dihentikan oleh pengguna." });
+    }
+
+    throw error;
+  } finally {
+    finishUserProcess(userId, "imgtoprompt", processController);
   }
-  res.json({ results });
 });
 
-// --- SDK HELPERS FOR PROMPT STUDIO & IMG TO PROMPT ---
+// --- SHARED HELPERS FOR PROMPT STUDIO & IMG TO PROMPT ---
 
-async function callGeminiWithSDK({ apiKeys, userId, model: modelId, prompt }) {
-  let currentIndex = userRotationIndex.get(userId) || 0;
-  let attempts = 0;
-  const maxAttempts = apiKeys.length;
+async function callGeminiWithSDK({ apiKeys, userId, model: modelId, prompt, signal }) {
+  const { text } = await callGeminiWithRotation({
+    apiKeys,
+    userId,
+    model: modelId,
+    parts: [{ text: prompt }],
+    generationConfig: { temperature: 0.9 },
+    signal
+  });
 
-  while (attempts < maxAttempts) {
-    // Stick to the currentIndex, then offset by attempts if it fails
-    const actualIndex = (currentIndex + attempts) % apiKeys.length;
-    const apiKey = apiKeys[actualIndex];
-
-    try {
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({
-        model: modelId,
-        generationConfig: { temperature: 0.9 } // Increased temperature for diversity
-      });
-      
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      const text = response.text().trim();
-
-      // Successful? Update the sticky index to this key
-      if (attempts > 0) {
-        userRotationIndex.set(userId, actualIndex);
-      }
-
-      return text;
-    } catch (err) {
-      console.error(`[SDK Text] Attempt ${attempts} failed with Key ${actualIndex}: ${err.message}`);
-      if (err.message.includes("429") || err.message.toLowerCase().includes("quota") || err.message.toLowerCase().includes("limit")) {
-        attempts++;
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new Error("Telah mencoba semua API key namun tetap terkena limit. Silakan tambahkan lebih banyak key.");
+  return text;
 }
 
-async function callGeminiMultimodalWithSDK({ apiKeys, userId, model: modelId, prompt, imageBuffer }) {
-  let currentIndex = userRotationIndex.get(userId) || 0;
-  let attempts = 0;
-  const maxAttempts = apiKeys.length;
-
-  while (attempts < maxAttempts) {
-    const actualIndex = (currentIndex + attempts) % apiKeys.length;
-    const apiKey = apiKeys[actualIndex];
-
-    try {
-      const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: modelId });
-      
-      const result = await model.generateContent([
-        prompt,
-        {
-          inlineData: {
-            data: imageBuffer.toString("base64"),
-            mimeType: "image/jpeg"
-          }
+async function callGeminiMultimodalWithSDK({
+  apiKeys,
+  userId,
+  model: modelId,
+  prompt,
+  imageBuffer,
+  mimeType,
+  signal
+}) {
+  const { text } = await callGeminiWithRotation({
+    apiKeys,
+    userId,
+    model: modelId,
+    parts: [
+      { text: prompt },
+      {
+        inlineData: {
+          data: imageBuffer.toString("base64"),
+          mimeType: mimeType || "image/jpeg"
         }
-      ]);
-      const response = await result.response;
-      const text = response.text().trim();
-
-      // Success? Save this index as the new sticky key
-      if (attempts > 0) {
-        userRotationIndex.set(userId, actualIndex);
       }
+    ],
+    signal
+  });
 
-      return text;
-    } catch (err) {
-      console.error(`[SDK Multimodal] Attempt ${attempts} failed with Key ${actualIndex}: ${err.message}`);
-      if (err.message.includes("429") || err.message.toLowerCase().includes("quota") || err.message.toLowerCase().includes("limit")) {
-        attempts++;
-        continue;
-      }
-      throw err;
-    }
-  }
-  throw new Error("Telah mencoba semua API key namun tetap terkena limit. Silakan tambahkan lebih banyak key.");
+  return text;
 }
 
-async function callPromptStudioWithRotation({ apiKeys, userId, model, instruction }) {
-  const totalKeys = apiKeys.length;
-  if (!totalKeys) {
-    throw new Error("Masukkan minimal satu API key Gemini.");
-  }
+async function callPromptStudioWithRotation({ apiKeys, userId, model, instruction, signal }) {
+  const { text, keyIndex } = await callGeminiWithRotation({
+    apiKeys,
+    userId,
+    model,
+    parts: [{ text: instruction }],
+    generationConfig: { temperature: 0.7 },
+    signal
+  });
 
-  let currentIndex = userRotationIndex.get(userId) || 0;
-  let attempts = 0;
-  let lastErrorText = "";
-  const invalidKeys = new Set();
-
-  while (attempts < totalKeys) {
-    let activeIndex = -1;
-    for (let step = 0; step < totalKeys; step += 1) {
-      const candidateIndex = (currentIndex + step) % totalKeys;
-      if (!invalidKeys.has(candidateIndex)) {
-        activeIndex = candidateIndex;
-        break;
-      }
-    }
-
-    if (activeIndex === -1) break;
-
-    const apiKey = apiKeys[activeIndex];
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-    try {
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: instruction }] }],
-          generationConfig: { temperature: 0.7 }
-        })
-      });
-
-      const rawText = await response.text();
-      lastErrorText = rawText;
-
-      if (!response.ok) {
-        if (isInvalidKeyError(response.status, rawText)) {
-          invalidKeys.add(activeIndex);
-        }
-
-        if (isLimitError(response.status, rawText) || isInvalidKeyError(response.status, rawText)) {
-          attempts += 1;
-          currentIndex = (activeIndex + 1) % totalKeys;
-          continue;
-        }
-
-        throw new Error(`Gemini failed: ${response.status} ${truncateText(rawText)}`);
-      }
-
-      const parsedResponse = JSON.parse(rawText);
-      const outputText =
-        parsedResponse?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim() || "";
-      const result = safeParseJSONObject(outputText);
-
-      userRotationIndex.set(userId, (activeIndex + 1) % totalKeys);
-      return { result, keyIndex: activeIndex };
-    } catch (error) {
-      if (attempts === totalKeys - 1) {
-        throw error;
-      }
-      attempts += 1;
-      currentIndex = (activeIndex + 1) % totalKeys;
-    }
-  }
-
-  throw new Error(`Semua API key gagal dipakai. Terakhir: ${truncateText(lastErrorText)}`);
+  return {
+    result: safeParseJSONObject(text),
+    keyIndex
+  };
 }
 
 // --- PROMPT STUDIO ENDPOINT ---
@@ -885,8 +979,7 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
     }
   }
 
-  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(userId);
-  const apiKeys = savedKeys.map((item) => item.key_value);
+  const apiKeys = getUserApiKeys(userId);
   if (!apiKeys.length) {
     return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
   }
@@ -894,9 +987,15 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
   const collected = [];
   const collectedPrompts = [];
   const maxRounds = 4;
+  const processController = startUserProcess(userId, "prompt-studio");
+  const { signal } = processController;
 
   try {
+    console.log(`[PromptStudio] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length)}.`);
+
     for (let round = 1; round <= maxRounds; round += 1) {
+      assertProcessActive(signal);
+
       const needed = batchSize - collected.length;
       if (needed <= 0) break;
 
@@ -916,7 +1015,8 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
         apiKeys,
         userId,
         model,
-        instruction
+        instruction,
+        signal
       });
 
       const batch = output.result?.results;
@@ -940,8 +1040,14 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
 
     res.json({ prompts: collected });
   } catch (err) {
+    if (isAbortLikeError(err)) {
+      return res.status(409).json({ error: "Proses Prompt Studio dihentikan oleh pengguna." });
+    }
+
     console.error(`[PromptStudio] Error: ${err.message}`);
     res.status(500).json({ error: err.message || "Internal server error" });
+  } finally {
+    finishUserProcess(userId, "prompt-studio", processController);
   }
 });
 
@@ -953,11 +1059,14 @@ app.post("/api/imgtoprompt/single", isAuthenticated, upload.single("image"), asy
 
   if (!file) return res.status(400).json({ error: "No image uploaded" });
 
-  const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(userId);
-  const apiKeys = savedKeys.map(k => k.key_value);
+  const apiKeys = getUserApiKeys(userId);
   if (!apiKeys.length) return res.status(400).json({ error: "Empty API keys" });
 
+  const processController = startUserProcess(userId, "imgtoprompt");
+  const { signal } = processController;
+
   try {
+    console.log(`[ImgToPrompt] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length)}.`);
     const creativityVal = Math.max(0, Math.min(100, Number(creativity || 50)));
     const cameraOn = camera === "true" || camera === "on";
     
@@ -971,13 +1080,21 @@ Return ONLY the prompt text.`;
       userId,
       model: model || "gemini-3-flash-preview",
       prompt: promptText,
-      imageBuffer: file.buffer
+      imageBuffer: file.buffer,
+      mimeType: file.mimetype,
+      signal
     });
 
     res.json({ fileName: file.originalname, prompt });
   } catch (err) {
+    if (isAbortLikeError(err)) {
+      return res.status(409).json({ error: "Proses Img To Prompt dihentikan oleh pengguna." });
+    }
+
     console.error(`[ImgToPrompt SDK] Error: ${err.message}`);
     res.status(500).json({ error: err.message });
+  } finally {
+    finishUserProcess(userId, "imgtoprompt", processController);
   }
 });
 

@@ -2,6 +2,7 @@ const dropZone = document.getElementById("dropZone");
 const fileInput = document.getElementById("fileInput");
 const cardsContainer = document.getElementById("cardsContainer");
 const generateButton = document.getElementById("generateButton");
+const stopButton = document.getElementById("stopButton");
 const resumeButton = document.getElementById("resumeButton");
 const exportButton = document.getElementById("exportButton");
 const clearAllButton = document.getElementById("clearAllButton");
@@ -84,7 +85,10 @@ const state = {
   files: [],
   user: null,
   keys: [],
-  activeKey: null
+  activeKey: null,
+  isGenerating: false,
+  stopRequested: false,
+  activeController: null
 };
 
 // --- AUTH & INITIALIZATION ---
@@ -583,8 +587,12 @@ async function processVectorFile(fileItem) {
 
 function checkConvertingState() {
   const isAnyConverting = state.files.some(f => f.status === "converting");
-  generateButton.disabled = isAnyConverting || state.files.length === 0;
-  if (isAnyConverting) {
+  generateButton.disabled = state.isGenerating || isAnyConverting || state.files.length === 0;
+  stopButton.style.display = state.isGenerating ? "inline-flex" : "none";
+
+  if (state.isGenerating) {
+    generateButton.innerHTML = "Generating...";
+  } else if (isAnyConverting) {
     generateButton.innerHTML = "Processing Vectors...";
   } else {
     generateButton.innerHTML = `Generate Metadata (${state.files.length})`;
@@ -614,6 +622,28 @@ function prepareFormData(items) {
   return form;
 }
 
+async function requestStop(tool) {
+  try {
+    await fetch("/api/process-control/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool })
+    });
+  } catch (error) {
+    console.warn("Failed to notify server to stop process:", error);
+  }
+}
+
+function setProcessingUI(isRunning) {
+  state.isGenerating = isRunning;
+  stopButton.style.display = isRunning ? "inline-flex" : "none";
+  stopButton.disabled = !isRunning;
+  resumeButton.disabled = isRunning;
+  exportButton.disabled = isRunning;
+  clearAllButton.disabled = isRunning;
+  checkConvertingState();
+}
+
 function escapeCsv(value) {
   return `"${String(value).replace(/"/g, '""')}"`;
 }
@@ -624,79 +654,101 @@ async function runGeneration(items) {
     return;
   }
 
-  generateButton.disabled = true;
-  resumeButton.disabled = true;
-  exportButton.disabled = true;
-
-  logToConsole(`Starting generation for ${items.length} file(s)...`, "system");
-
-  const concurrencyLimit = 2; // Process 2 files at a time
-  let index = 0;
-
-  async function processNext() {
-    if (index >= items.length) return;
-    const item = items[index++];
-    
-    logToConsole(`File "${item.file.name}": Uploading and processing...`, "info");
-    
-    // Prepare form for single file
-    const form = new FormData();
-    form.append("files", item.file);
-    form.append("model", modelSelect.value);
-    form.append("titleLength", titleLength.value);
-    form.append("keywordCount", keywordCount.value);
-    form.append("prefixEnabled", prefixEnabled.checked);
-    form.append("prefixText", prefixText.value);
-    form.append("suffixEnabled", suffixEnabled.checked);
-    form.append("suffixText", suffixText.value);
-    form.append("negativeTitleWords", negativeTitleWords.value);
-    form.append("negativeKeywords", negativeKeywords.value);
-    normalizePlatformSelection().forEach((platform) => form.append("platforms", platform));
-
-    try {
-      item.status = "processing";
-      renderCards();
-
-      const response = await fetch("/api/generate", { method: "POST", body: form });
-      const contentType = response.headers.get("content-type") || "";
-      const raw = await response.text();
-      if (!contentType.includes("application/json")) {
-        throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
-      }
-      const data = JSON.parse(raw);
-      
-      if (!response.ok) throw new Error(data.error || "Server error");
-
-      const result = data.items[0]; // Server returns array of 1
-      if (!result || result.status === "failed") throw new Error(result?.error || "AI processing failed");
-
-      item.status = "done";
-      item.title = result.title;
-      item.description = result.description;
-      item.keywords = result.keywords;
-      item.categoryAdobe = result.categoryAdobe;
-      item.categoryShutterstock = result.categoryShutterstock;
-      
-      logToConsole(`File "${item.file.name}": Successfully generated!`, "success");
-    } catch (error) {
-      item.status = "failed";
-      item.error = error.message;
-      logToConsole(`File "${item.file.name}": Error - ${error.message}`, "error");
-    } finally {
-      renderCards();
-      updateSummary();
-      await processNext(); // Get next item from queue
-    }
+  if (state.isGenerating) {
+    return;
   }
 
-  // Start concurrent runners
-  const runners = Array.from({ length: Math.min(items.length, concurrencyLimit) }, () => processNext());
-  await Promise.all(runners);
+  state.stopRequested = false;
+  state.activeController = new AbortController();
+  setProcessingUI(true);
 
-  logToConsole("All tasks in the current batch completed.", "system");
-  generateButton.disabled = false;
-  resumeButton.disabled = false;
-  exportButton.disabled = false;
+  logToConsole(`Starting generation for ${items.length} file(s)...`, "system");
+  let activeItem = null;
+
+  try {
+    for (const item of items) {
+      if (state.stopRequested) break;
+
+      activeItem = item;
+      logToConsole(`File "${item.file.name}": Uploading and processing...`, "info");
+
+      const form = new FormData();
+      form.append("files", item.file);
+      form.append("model", modelSelect.value);
+      form.append("titleLength", titleLength.value);
+      form.append("keywordCount", keywordCount.value);
+      form.append("prefixEnabled", prefixEnabled.checked);
+      form.append("prefixText", prefixText.value);
+      form.append("suffixEnabled", suffixEnabled.checked);
+      form.append("suffixText", suffixText.value);
+      form.append("negativeTitleWords", negativeTitleWords.value);
+      form.append("negativeKeywords", negativeKeywords.value);
+      normalizePlatformSelection().forEach((platform) => form.append("platforms", platform));
+
+      item.status = "processing";
+      item.error = null;
+      renderCards();
+      updateSummary();
+
+      try {
+        const response = await fetch("/api/generate", {
+          method: "POST",
+          body: form,
+          signal: state.activeController.signal
+        });
+        const contentType = response.headers.get("content-type") || "";
+        const raw = await response.text();
+        if (!contentType.includes("application/json")) {
+          throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+        }
+        const data = JSON.parse(raw);
+        
+        if (!response.ok) throw new Error(data.error || "Server error");
+
+        const result = data.items[0];
+        if (!result || result.status === "failed") throw new Error(result?.error || "AI processing failed");
+
+        item.status = "done";
+        item.title = result.title;
+        item.description = result.description;
+        item.keywords = result.keywords;
+        item.categoryAdobe = result.categoryAdobe;
+        item.categoryShutterstock = result.categoryShutterstock;
+        
+        logToConsole(`File "${item.file.name}": Successfully generated!`, "success");
+      } catch (error) {
+        if (error.name === "AbortError" || state.stopRequested) {
+          item.status = "pending";
+          item.error = null;
+          break;
+        }
+
+        item.status = "failed";
+        item.error = error.message;
+        logToConsole(`File "${item.file.name}": Error - ${error.message}`, "error");
+      } finally {
+        renderCards();
+        updateSummary();
+      }
+    }
+
+    if (state.stopRequested) {
+      logToConsole("Metadata process stopped by user.", "system");
+    } else {
+      logToConsole("All tasks in the current batch completed.", "system");
+    }
+  } finally {
+    if (state.stopRequested && activeItem?.status === "processing") {
+      activeItem.status = "pending";
+      activeItem.error = null;
+    }
+
+    state.stopRequested = false;
+    state.activeController = null;
+    setProcessingUI(false);
+    renderCards();
+    updateSummary();
+  }
 }
 
 generateButton.addEventListener("click", () => {
@@ -705,11 +757,27 @@ generateButton.addEventListener("click", () => {
     return;
   }
   state.files.forEach((item) => {
-    item.status = "processing";
+    item.status = "pending";
     item.error = null;
   });
   renderCards();
   runGeneration(state.files);
+});
+
+stopButton.addEventListener("click", async () => {
+  if (!state.isGenerating) {
+    return;
+  }
+
+  state.stopRequested = true;
+  stopButton.disabled = true;
+  logToConsole("Stopping metadata process...", "system");
+
+  if (state.activeController) {
+    state.activeController.abort();
+  }
+
+  await requestStop("metadata");
 });
 
 resumeButton.addEventListener("click", () => {
@@ -719,7 +787,7 @@ resumeButton.addEventListener("click", () => {
     return;
   }
   failedItems.forEach((item) => {
-    item.status = "processing";
+    item.status = "pending";
     item.error = null;
   });
   renderCards();
