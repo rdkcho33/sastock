@@ -60,6 +60,31 @@
       background: var(--accent-primary);
       color: white;
     }
+    .mode-toggle {
+      display: flex;
+      background: rgba(0,0,0,0.3);
+      border-radius: 8px;
+      padding: 4px;
+      margin-bottom: 10px;
+    }
+    .mode-btn {
+      flex: 1;
+      border: none;
+      background: none;
+      color: var(--text-muted);
+      padding: 8px;
+      font-size: 12px;
+      cursor: pointer;
+      border-radius: 6px;
+      transition: all 0.2s;
+    }
+    .mode-btn.active {
+      background: var(--accent-primary);
+      color: white;
+    }
+    .manual-fields.is-disabled {
+      opacity: 0.55;
+    }
   </style>
 </head>
 <body>
@@ -131,9 +156,9 @@
           <button id="langID" class="lang-btn" onclick="setLang('id')">Indonesia</button>
         </div>
 
-        <label class="section-label">BATCH COUNT (MAX 50)</label>
-        <input type="number" id="batchCount" class="styled-input" min="1" max="50" value="5" />
-        <p class="text-muted" style="font-size:10px; margin-top:4px;">Large batches run in a robust queue to avoid timeouts.</p>
+        <label class="section-label">BATCH COUNT (MAX 20)</label>
+        <input type="number" id="batchCount" class="styled-input" min="1" max="20" value="5" />
+        <p class="text-muted" style="font-size:10px; margin-top:4px;">Batch 1-20. Sistem akan menghindari prompt yang terlalu mirip.</p>
       </div>
     </aside>
 
@@ -154,6 +179,31 @@
             <label class="section-label">OBJEK FOTO (OBJECTS)</label>
             <textarea id="objectInput" class="styled-input" placeholder="Contoh: 2 orang pria berpakaian formal sedang tertawa" style="height: 100px;"></textarea>
           </div>
+        </div>
+
+        <div style="margin-top: 20px;">
+          <label class="section-label">GENERATION MODE</label>
+          <div class="mode-toggle">
+            <button id="modeAUTO" type="button" class="mode-btn active" onclick="setMode('AUTO')">AUTO</button>
+            <button id="modeMANUAL" type="button" class="mode-btn" onclick="setMode('MANUAL')">MANUAL</button>
+          </div>
+          <p id="modeHint" class="text-muted" style="font-size:10px; margin-top:4px;">Mode AUTO aktif: AI akan mengisi expression, activity, dan background secara relevan.</p>
+        </div>
+
+        <div id="manualFields" class="studio-grid manual-fields is-disabled" style="margin-top: 20px;">
+          <div class="input-group">
+            <label class="section-label">EXPRESSION (MANUAL)</label>
+            <textarea id="expressionInput" class="styled-input" placeholder="Contoh: tersenyum percaya diri, ekspresi fokus" style="height: 90px;" disabled></textarea>
+          </div>
+          <div class="input-group">
+            <label class="section-label">ACTIVITY (MANUAL)</label>
+            <textarea id="activityInput" class="styled-input" placeholder="Contoh: berjabat tangan, berdiskusi, memegang produk" style="height: 90px;" disabled></textarea>
+          </div>
+        </div>
+
+        <div style="margin-top: 20px;">
+          <label class="section-label">BACKGROUND (MANUAL)</label>
+          <textarea id="backgroundInput" class="styled-input" placeholder="Contoh: modern office interior, white seamless studio, urban coffee shop" style="height: 90px;" disabled></textarea>
         </div>
 
         <div class="action-bar" style="margin-top: 20px;">

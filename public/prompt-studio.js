@@ -1,17 +1,19 @@
-// prompt-studio.js
-
 const state = {
   user: null,
-  lang: 'en',
+  lang: "en",
+  mode: "AUTO",
   results: [],
   isGenerating: false
 };
 
-// --- LOG CONSOLE UTILITY ---
 const logBody = document.getElementById("logBody");
 const toggleLogBtn = document.getElementById("toggleLogBtn");
 const clearLogBtn = document.getElementById("clearLogBtn");
 const logConsole = document.getElementById("logConsole");
+const generateBtn = document.getElementById("generateBtn");
+const resultsList = document.getElementById("resultsList");
+const copyAllBtn = document.getElementById("copyAllBtn");
+const clearBtn = document.getElementById("clearBtn");
 
 function logToConsole(message, type = "info") {
   if (!logBody) return;
@@ -23,10 +25,43 @@ function logToConsole(message, type = "info") {
   logBody.scrollTop = logBody.scrollHeight;
 }
 
+async function readJsonResponse(res) {
+  const contentType = res.headers.get("content-type") || "";
+  const raw = await res.text();
+  if (!contentType.includes("application/json")) {
+    throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw new Error(`Invalid JSON response: ${raw.slice(0, 200)}`);
+  }
+}
+
+function setMode(mode) {
+  state.mode = mode === "MANUAL" ? "MANUAL" : "AUTO";
+  const isManual = state.mode === "MANUAL";
+
+  document.getElementById("modeAUTO").classList.toggle("active", !isManual);
+  document.getElementById("modeMANUAL").classList.toggle("active", isManual);
+  document.getElementById("expressionInput").disabled = !isManual;
+  document.getElementById("activityInput").disabled = !isManual;
+  document.getElementById("backgroundInput").disabled = !isManual;
+  document.getElementById("manualFields").classList.toggle("is-disabled", !isManual);
+  document.getElementById("modeHint").textContent = isManual
+    ? "Mode MANUAL aktif: expression, activity, dan background akan dipakai persis seperti input Anda."
+    : "Mode AUTO aktif: AI akan mengisi expression, activity, dan background secara relevan.";
+}
+
+window.setMode = setMode;
+
 if (toggleLogBtn) {
   toggleLogBtn.onclick = () => {
     logConsole.classList.toggle("minimized");
-    toggleLogBtn.querySelector("svg").style.transform = logConsole.classList.contains("minimized") ? "rotate(0deg)" : "rotate(180deg)";
+    toggleLogBtn.querySelector("svg").style.transform = logConsole.classList.contains("minimized")
+      ? "rotate(0deg)"
+      : "rotate(180deg)";
   };
 }
 
@@ -36,48 +71,36 @@ if (clearLogBtn) {
   };
 }
 
-// --- AUTH ---
 async function init() {
   try {
-    const res = await fetch("/api/auth/me");
-    const contentType = res.headers.get("content-type") || "";
-    const raw = await res.text();
-    if (!contentType.includes("application/json")) {
-      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
-    }
-    const auth = JSON.parse(raw);
+    const auth = await readJsonResponse(await fetch("/api/auth/me"));
     if (!auth.authenticated) {
       window.location.href = "/login.html";
       return;
     }
+
     state.user = auth.user;
     document.getElementById("userName").textContent = state.user.username;
     document.getElementById("userRole").textContent = state.user.role;
     document.getElementById("userProfile").style.display = "flex";
-    
+
     await fetchKeys();
-  } catch (err) {
+  } catch {
     window.location.href = "/login.html";
   }
 }
 
 async function fetchKeys() {
   try {
-    const res = await fetch("/api/keys");
-    const contentType = res.headers.get("content-type") || "";
-    const raw = await res.text();
-    if (!contentType.includes("application/json")) {
-      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
-    }
-    const data = JSON.parse(raw);
+    const data = await readJsonResponse(await fetch("/api/keys"));
     const select = document.getElementById("activeKeySelect");
-    
+
     if (data.keys && data.keys.length > 0) {
-      select.innerHTML = data.keys.map(k => `<option value="${k.key_value}">${k.label}</option>`).join("");
+      select.innerHTML = data.keys.map((key) => `<option value="${key.key_value}">${key.label}</option>`).join("");
     } else {
       select.innerHTML = '<option value="">No keys found</option>';
     }
-  } catch (err) {
+  } catch {
     console.error("Failed to fetch keys");
   }
 }
@@ -87,94 +110,11 @@ document.getElementById("logoutBtn").onclick = async () => {
   window.location.href = "/login.html";
 };
 
-// --- LANGUAGE TOGGLE ---
-window.setLang = (l) => {
-  state.lang = l;
-  document.getElementById("langEN").classList.toggle("active", l === 'en');
-  document.getElementById("langID").classList.toggle("active", l === 'id');
-  logToConsole(`Output language set to: ${l === 'id' ? 'Indonesia' : 'English'}`, "system");
-};
-
-// --- GENERATION LOGIC ---
-const generateBtn = document.getElementById("generateBtn");
-const resultsList = document.getElementById("resultsList");
-const copyAllBtn = document.getElementById("copyAllBtn");
-const clearBtn = document.getElementById("clearBtn");
-
-generateBtn.onclick = async () => {
-  const purpose = document.getElementById("purposeInput").value.trim();
-  const object = document.getElementById("objectInput").value.trim();
-  const batchCount = parseInt(document.getElementById("batchCount").value) || 1;
-  const model = document.getElementById("modelSelect").value;
-  
-  if (!purpose || !object) return alert("Please fill in both Purpose and Object.");
-  if (batchCount > 50) return alert("Maximum batch count is 50.");
-  
-  state.isGenerating = true;
-  generateBtn.disabled = true;
-  generateBtn.innerHTML = `<span>Generating batch of ${batchCount}...</span>`;
-  logToConsole(`Requesting ${batchCount} prompts in one batch...`, "info");
-
-  // Create pending cards first for UX
-  const cardIds = [];
-  for (let i = 0; i < batchCount; i++) {
-    const tempId = Date.now() + i;
-    cardIds.push(tempId);
-    addPendingCard(tempId, i + 1);
-  }
-
-  try {
-    const res = await fetch("/api/prompt-studio/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ purpose, object, lang: state.lang, model, count: batchCount })
-    });
-    
-    const contentType = res.headers.get("content-type") || "";
-    const raw = await res.text();
-    if (!contentType.includes("application/json")) {
-      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
-    }
-    const data = JSON.parse(raw);
-    
-    if (!res.ok) {
-      throw new Error(data.error || "Generation failed");
-    }
-
-    const prompts = Array.isArray(data.prompts) ? data.prompts : [data.prompt];
-    
-    // Fill the cards
-    prompts.forEach((p, idx) => {
-        if (idx < cardIds.length) {
-            updateCard(cardIds[idx], p);
-            state.results.push(p);
-        } else {
-            // If AI returned more than requested (unlikely), create new cards
-            const newId = Date.now() + 100 + idx;
-            addPendingCard(newId, idx + 1);
-            updateCard(newId, p);
-            state.results.push(p);
-        }
-    });
-
-    // Handle any cards that didn't get a prompt (if AI returned fewer than requested)
-    if (prompts.length < cardIds.length) {
-        for (let j = prompts.length; j < cardIds.length; j++) {
-            updateCardError(cardIds[j], "AI did not generate this prompt in the batch.");
-        }
-    }
-
-    logToConsole(`Successfully generated ${prompts.length} prompts.`, "success");
-    if (state.results.length > 0) copyAllBtn.style.display = "inline-block";
-
-  } catch (err) {
-    cardIds.forEach(id => updateCardError(id, err.message));
-    logToConsole(`Batch failed: ${err.message}`, "error");
-  }
-  
-  state.isGenerating = false;
-  generateBtn.disabled = false;
-  generateBtn.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:8px;"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"></path><path d="M5 3v4"></path><path d="M19 17v4"></path><path d="M3 5h4"></path><path d="M17 19h4"></path></svg> Generate Stock Prompts`;
+window.setLang = (lang) => {
+  state.lang = lang;
+  document.getElementById("langEN").classList.toggle("active", lang === "en");
+  document.getElementById("langID").classList.toggle("active", lang === "id");
+  logToConsole(`Output language set to: ${lang === "id" ? "Indonesia" : "English"}`, "system");
 };
 
 function addPendingCard(id, index) {
@@ -207,20 +147,116 @@ function updateCardError(id, error) {
   `;
 }
 
-window.copyCardPrompt = (btn) => {
-  const text = btn.previousElementSibling.value;
+generateBtn.onclick = async () => {
+  const purpose = document.getElementById("purposeInput").value.trim();
+  const object = document.getElementById("objectInput").value.trim();
+  const expression = document.getElementById("expressionInput").value.trim();
+  const activity = document.getElementById("activityInput").value.trim();
+  const background = document.getElementById("backgroundInput").value.trim();
+  const batchCount = parseInt(document.getElementById("batchCount").value, 10) || 1;
+  const model = document.getElementById("modelSelect").value;
+
+  if (!purpose || !object) {
+    alert("Please fill in both Purpose and Object.");
+    return;
+  }
+
+  if (batchCount > 20) {
+    alert("Maximum batch count is 20.");
+    return;
+  }
+
+  if (state.mode === "MANUAL" && (!expression || !activity || !background)) {
+    alert("Please fill Expression, Activity, and Background in MANUAL mode.");
+    return;
+  }
+
+  state.isGenerating = true;
+  state.results = [];
+  resultsList.innerHTML = "";
+  copyAllBtn.style.display = "none";
+
+  generateBtn.disabled = true;
+  generateBtn.innerHTML = `<span>Generating batch of ${batchCount}...</span>`;
+  logToConsole(`Requesting ${batchCount} prompts in ${state.mode} mode...`, "info");
+
+  const cardIds = [];
+  for (let i = 0; i < batchCount; i += 1) {
+    const tempId = Date.now() + i;
+    cardIds.push(tempId);
+    addPendingCard(tempId, i + 1);
+  }
+
+  try {
+    const response = await fetch("/api/prompt-studio/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        mode: state.mode,
+        purpose,
+        object,
+        expression,
+        activity,
+        background,
+        lang: state.lang,
+        model,
+        count: batchCount
+      })
+    });
+
+    const data = await readJsonResponse(response);
+    if (!response.ok) {
+      throw new Error(data.error || "Generation failed");
+    }
+
+    const prompts = Array.isArray(data.prompts) ? data.prompts.filter(Boolean) : [];
+
+    prompts.forEach((prompt, index) => {
+      if (index < cardIds.length) {
+        updateCard(cardIds[index], prompt);
+      } else {
+        const newId = Date.now() + 100 + index;
+        addPendingCard(newId, index + 1);
+        updateCard(newId, prompt);
+      }
+    });
+
+    if (prompts.length < cardIds.length) {
+      for (let index = prompts.length; index < cardIds.length; index += 1) {
+        updateCardError(cardIds[index], "AI did not generate this prompt in the batch.");
+      }
+    }
+
+    state.results = prompts;
+    if (state.results.length > 0) {
+      copyAllBtn.style.display = "inline-block";
+    }
+
+    logToConsole(`Successfully generated ${prompts.length} prompts.`, "success");
+  } catch (err) {
+    cardIds.forEach((id) => updateCardError(id, err.message));
+    logToConsole(`Batch failed: ${err.message}`, "error");
+  }
+
+  state.isGenerating = false;
+  generateBtn.disabled = false;
+  generateBtn.innerHTML = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:8px;"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"></path><path d="M5 3v4"></path><path d="M19 17v4"></path><path d="M3 5h4"></path><path d="M17 19h4"></path></svg> Generate Stock Prompts`;
+};
+
+window.copyCardPrompt = (button) => {
+  const text = button.previousElementSibling.value;
   navigator.clipboard.writeText(text);
-  const original = btn.innerText;
-  btn.innerText = "Copied!";
-  btn.classList.add("btn-success");
+  const original = button.innerText;
+  button.innerText = "Copied!";
+  button.classList.add("btn-success");
   setTimeout(() => {
-    btn.innerText = original;
-    btn.classList.remove("btn-success");
+    button.innerText = original;
+    button.classList.remove("btn-success");
   }, 2000);
 };
 
 copyAllBtn.onclick = () => {
-  const allText = state.results.join("\n\n");
+  const allText = state.results.join("\n");
   navigator.clipboard.writeText(allText);
   const original = copyAllBtn.innerText;
   copyAllBtn.innerText = "All Copied!";
@@ -238,4 +274,5 @@ clearBtn.onclick = () => {
   logToConsole("Workspace cleared.", "system");
 };
 
+setMode("AUTO");
 init();

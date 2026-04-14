@@ -227,6 +227,148 @@ function parseApiKeys(raw) {
     .filter(Boolean);
 }
 
+function truncateText(value, maxLength = 400) {
+  if (!value) return "";
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;
+}
+
+function normalizePromptText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .trim();
+}
+
+function jaccardSimilarity(a, b) {
+  const wordsA = new Set(normalizePromptText(a).split(" ").filter(Boolean));
+  const wordsB = new Set(normalizePromptText(b).split(" ").filter(Boolean));
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+
+  let intersection = 0;
+  for (const word of wordsA) {
+    if (wordsB.has(word)) intersection += 1;
+  }
+
+  const union = wordsA.size + wordsB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function isTooSimilar(existingPrompts, candidatePrompt) {
+  const candidate = normalizePromptText(candidatePrompt);
+  if (!candidate) return true;
+
+  for (const existing of existingPrompts) {
+    const normalizedExisting = normalizePromptText(existing);
+    if (!normalizedExisting) continue;
+    if (normalizedExisting === candidate) return true;
+    if (jaccardSimilarity(normalizedExisting, candidate) >= 0.85) return true;
+  }
+
+  return false;
+}
+
+function isLimitError(status, bodyText) {
+  const text = String(bodyText || "").toLowerCase();
+  return (
+    status === 429 ||
+    text.includes("rate limit") ||
+    text.includes("quota") ||
+    text.includes("quota exceeded") ||
+    text.includes("resource_exhausted")
+  );
+}
+
+function isInvalidKeyError(status, bodyText) {
+  const text = String(bodyText || "").toLowerCase();
+  return (
+    status === 401 ||
+    status === 403 ||
+    text.includes("api key not valid") ||
+    text.includes("invalid api key") ||
+    text.includes("permission")
+  );
+}
+
+function safeParseJSONObject(text) {
+  const raw = String(text || "").trim();
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const start = raw.indexOf("{");
+    const end = raw.lastIndexOf("}");
+    if (start !== -1 && end !== -1 && end > start) {
+      return JSON.parse(raw.slice(start, end + 1));
+    }
+    throw new Error("Model output bukan JSON valid.");
+  }
+}
+
+function buildPromptStudioInstruction(payload) {
+  const {
+    mode,
+    purpose,
+    object,
+    expression,
+    activity,
+    background,
+    count,
+    lang,
+    blockedPrompts = []
+  } = payload;
+
+  const batchSize = Math.max(1, Math.min(20, Number(count || 1)));
+  const outputLanguage = lang === "id" ? "Bahasa Indonesia" : "English";
+  const doNotRepeat = blockedPrompts.length
+    ? `\nJANGAN mengulang atau membuat prompt_final yang mirip dengan daftar berikut:\n- ${blockedPrompts.join("\n- ")}\n`
+    : "";
+
+  return [
+    'Anda adalah "Prompt Studio" untuk prompt fotografi stock realistis.',
+    `Bahasa output wajib: ${outputLanguage}.`,
+    "Gaya utama: realistic stock photography, natural, commercial-ready, tanpa elemen futuristik kecuali diminta user.",
+    "",
+    "Template utama:",
+    "Buat foto [Tujuan foto] yang menampilkan [objek] dengan [ekspresi], sedang [aktivitas], berlatar [background].",
+    "",
+    'Jika mode=AUTO: isi "ekspresi", "aktivitas", dan "background" secara kreatif tapi relevan berdasarkan tujuan foto + objek.',
+    'Jika mode=MANUAL: gunakan persis nilai ekspresi/aktivitas/background dari user, jangan mengubah makna.',
+    "",
+    `PENTING: Anda akan membuat ${batchSize} prompt dalam satu batch. Semua item HARUS BERBEDA JELAS.`,
+    "Variasikan minimal 2 aspek per item: ekspresi, aktivitas, background, framing, angle, mood, waktu, atau setting.",
+    "JANGAN mengulang kalimat prompt_final yang sama atau nyaris sama.",
+    doNotRepeat.trimEnd(),
+    "",
+    "Tambahkan penjaga kualitas ringkas di setiap prompt_final: natural lighting, sharp details, clean composition, no text, no watermark.",
+    "",
+    "Keluarkan JSON VALID saja (tanpa markdown) dengan skema:",
+    "{",
+    '  "results": [',
+    "    {",
+    '      "mode": "AUTO|MANUAL",',
+    '      "purpose": string,',
+    '      "object": string,',
+    '      "expression": string,',
+    '      "activity": string,',
+    '      "background": string,',
+    '      "prompt_final": string',
+    "    }",
+    "  ]",
+    "}",
+    `Jumlah elemen results harus tepat ${batchSize}.`,
+    "",
+    "DATA USER:",
+    `mode=${mode}`,
+    `purpose=${purpose || ""}`,
+    `object=${object || ""}`,
+    `expression=${expression || ""}`,
+    `activity=${activity || ""}`,
+    `background=${background || ""}`
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function buildPrompt(file, options) {
   const typeHint = file.ext || file.mimetype || "asset";
   const platformLabels = options.platforms.length > 0 ? options.platforms.join(", ") : "microstock platforms";
@@ -637,62 +779,169 @@ async function callGeminiMultimodalWithSDK({ apiKeys, userId, model: modelId, pr
   throw new Error("Telah mencoba semua API key namun tetap terkena limit. Silakan tambahkan lebih banyak key.");
 }
 
-// --- NEW PROMPT STUDIO ENDPOINT (SDK) ---
-app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
-  const { purpose, object, lang, model, count } = req.body;
-  const userId = req.session.userId;
-  const batchSize = Math.max(1, Math.min(20, Number(count || 1)));
+async function callPromptStudioWithRotation({ apiKeys, userId, model, instruction }) {
+  const totalKeys = apiKeys.length;
+  if (!totalKeys) {
+    throw new Error("Masukkan minimal satu API key Gemini.");
+  }
 
-  if (!purpose || !object) {
-    return res.status(400).json({ error: "Purpose and Object are required." });
+  let currentIndex = userRotationIndex.get(userId) || 0;
+  let attempts = 0;
+  let lastErrorText = "";
+  const invalidKeys = new Set();
+
+  while (attempts < totalKeys) {
+    let activeIndex = -1;
+    for (let step = 0; step < totalKeys; step += 1) {
+      const candidateIndex = (currentIndex + step) % totalKeys;
+      if (!invalidKeys.has(candidateIndex)) {
+        activeIndex = candidateIndex;
+        break;
+      }
+    }
+
+    if (activeIndex === -1) break;
+
+    const apiKey = apiKeys[activeIndex];
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: instruction }] }],
+          generationConfig: { temperature: 0.7 }
+        })
+      });
+
+      const rawText = await response.text();
+      lastErrorText = rawText;
+
+      if (!response.ok) {
+        if (isInvalidKeyError(response.status, rawText)) {
+          invalidKeys.add(activeIndex);
+        }
+
+        if (isLimitError(response.status, rawText) || isInvalidKeyError(response.status, rawText)) {
+          attempts += 1;
+          currentIndex = (activeIndex + 1) % totalKeys;
+          continue;
+        }
+
+        throw new Error(`Gemini failed: ${response.status} ${truncateText(rawText)}`);
+      }
+
+      const parsedResponse = JSON.parse(rawText);
+      const outputText =
+        parsedResponse?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("").trim() || "";
+      const result = safeParseJSONObject(outputText);
+
+      userRotationIndex.set(userId, (activeIndex + 1) % totalKeys);
+      return { result, keyIndex: activeIndex };
+    } catch (error) {
+      if (attempts === totalKeys - 1) {
+        throw error;
+      }
+      attempts += 1;
+      currentIndex = (activeIndex + 1) % totalKeys;
+    }
+  }
+
+  throw new Error(`Semua API key gagal dipakai. Terakhir: ${truncateText(lastErrorText)}`);
+}
+
+// --- PROMPT STUDIO ENDPOINT ---
+app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
+  const userId = req.session.userId;
+  const payload = req.body || {};
+  const batchSize = Math.max(1, Math.min(20, Number(payload.count || 1)));
+  const mode = payload.mode === "MANUAL" ? "MANUAL" : "AUTO";
+  const purpose = String(payload.purpose || "").trim();
+  const object = String(payload.object || "").trim();
+  const expression = String(payload.expression || "").trim();
+  const activity = String(payload.activity || "").trim();
+  const background = String(payload.background || "").trim();
+  const lang = payload.lang === "id" ? "id" : "en";
+  const model = String(payload.model || "").trim() || "gemini-2.5-flash";
+
+  if (!purpose) {
+    return res.status(400).json({ error: "Purpose wajib diisi." });
+  }
+
+  if (!object) {
+    return res.status(400).json({ error: "Object wajib diisi." });
+  }
+
+  if (mode === "MANUAL") {
+    for (const [field, label] of [
+      ["expression", "Expression"],
+      ["activity", "Activity"],
+      ["background", "Background"]
+    ]) {
+      if (!String(payload[field] || "").trim()) {
+        return res.status(400).json({ error: `${label} wajib diisi pada mode MANUAL.` });
+      }
+    }
   }
 
   const savedKeys = db.prepare("SELECT key_value FROM api_keys WHERE user_id = ?").all(userId);
-  const apiKeys = savedKeys.map(k => k.key_value);
-  if (!apiKeys.length) return res.status(400).json({ error: "Empty API keys" });
+  const apiKeys = savedKeys.map((item) => item.key_value);
+  if (!apiKeys.length) {
+    return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
+  }
+
+  const collected = [];
+  const collectedPrompts = [];
+  const maxRounds = 4;
 
   try {
-    const systemPrompt = `You are a professional stock photographer and AI prompt expert.
-Style: Purely realistic photography. NO futuristic/special effects unless requested.
-Purpose: ${purpose}
-Object: ${object}
-Language: ${lang === 'id' ? 'Indonesian' : 'English'}
+    for (let round = 1; round <= maxRounds; round += 1) {
+      const needed = batchSize - collected.length;
+      if (needed <= 0) break;
 
-Your task: Generate a batch of ${batchSize} UNIQUE and DIVERSE prompts.
-Ensure each prompt has a DIFFERENT activity, setting, camera angle, and lighting mood.
-Example scenarios to vary: morning vs sunset, indoor vs outdoor, action vs portrait, close-up vs wide shot.
+      const instruction = buildPromptStudioInstruction({
+        mode,
+        purpose,
+        object,
+        expression,
+        activity,
+        background,
+        count: needed,
+        lang,
+        blockedPrompts: collectedPrompts
+      });
 
-CRITICAL: Return ONLY a valid JSON array of strings containing exactly ${batchSize} prompts.
-Format: ["prompt 1...", "prompt 2...", ...]
-Absolutely NO explanations/markdown/intro/outro.`;
+      const output = await callPromptStudioWithRotation({
+        apiKeys,
+        userId,
+        model,
+        instruction
+      });
 
-    const rawResult = await callGeminiWithSDK({
-      apiKeys,
-      userId,
-      model: model || "gemini-3-flash-preview",
-      prompt: systemPrompt
-    });
-
-    // Try to parse as array
-    let prompts = [];
-    try {
-      const start = rawResult.indexOf("[");
-      const end = rawResult.lastIndexOf("]");
-      if (start !== -1 && end !== -1 && end > start) {
-        prompts = JSON.parse(rawResult.substring(start, end + 1));
-      } else {
-        // Fallback for non-json response
-        prompts = [rawResult];
+      const batch = output.result?.results;
+      if (!Array.isArray(batch)) {
+        throw new Error("Format output model tidak sesuai (results[] tidak ada).");
       }
-    } catch (pErr) {
-      console.warn("[PromptStudio] Failed to parse JSON array, using fallback.");
-      prompts = [rawResult];
+
+      for (const item of batch) {
+        const promptFinal = String(item?.prompt_final || "").replace(/\r?\n/g, " ").trim();
+        if (!isTooSimilar(collectedPrompts, promptFinal)) {
+          collected.push(promptFinal);
+          collectedPrompts.push(promptFinal);
+        }
+        if (collected.length >= batchSize) break;
+      }
     }
 
-    res.json({ prompts });
+    if (!collected.length) {
+      return res.status(500).json({ error: "Gagal membuat prompt unik." });
+    }
+
+    res.json({ prompts: collected });
   } catch (err) {
-    console.error(`[PromptStudio SDK] Error: ${err.message}`);
-    res.status(500).json({ error: err.message });
+    console.error(`[PromptStudio] Error: ${err.message}`);
+    res.status(500).json({ error: err.message || "Internal server error" });
   }
 });
 
@@ -743,4 +992,4 @@ app.use("/api", (err, req, res, next) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`SASTOCK metadata tool listening on http://localhost:${PORT}`);
-});
+});
