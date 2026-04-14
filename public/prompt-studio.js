@@ -112,49 +112,64 @@ generateBtn.onclick = async () => {
   
   state.isGenerating = true;
   generateBtn.disabled = true;
-  generateBtn.innerHTML = `<span>Generating 0/${batchCount}...</span>`;
-  logToConsole(`Starting production of ${batchCount} prompts...`, "info");
+  generateBtn.innerHTML = `<span>Generating batch of ${batchCount}...</span>`;
+  logToConsole(`Requesting ${batchCount} prompts in one batch...`, "info");
 
+  // Create pending cards first for UX
+  const cardIds = [];
   for (let i = 0; i < batchCount; i++) {
     const tempId = Date.now() + i;
+    cardIds.push(tempId);
     addPendingCard(tempId, i + 1);
+  }
+
+  try {
+    const res = await fetch("/api/prompt-studio/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ purpose, object, lang: state.lang, model, count: batchCount })
+    });
     
-    try {
-      const res = await fetch("/api/prompt-studio/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ purpose, object, lang: state.lang, model })
-      });
-      
-      if (!res.ok) {
-        const contentType = res.headers.get("content-type") || "";
-        const raw = await res.text();
-        if (!contentType.includes("application/json")) {
-          throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
-        }
-        const errData = JSON.parse(raw);
-        throw new Error(errData.error || "Generation failed");
-      }
-      
-      const contentType = res.headers.get("content-type") || "";
-      const raw = await res.text();
-      if (!contentType.includes("application/json")) {
-        throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
-      }
-      const data = JSON.parse(raw);
-      updateCard(tempId, data.prompt);
-      state.results.push(data.prompt);
-      logToConsole(`[${i+1}/${batchCount}] Success!`, "success");
-    } catch (err) {
-      updateCardError(tempId, err.message);
-      logToConsole(`[${i+1}/${batchCount}] Failed: ${err.message}`, "error");
+    const contentType = res.headers.get("content-type") || "";
+    const raw = await res.text();
+    if (!contentType.includes("application/json")) {
+      throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
     }
+    const data = JSON.parse(raw);
     
-    generateBtn.innerHTML = `<span>Generating ${i+1}/${batchCount}...</span>`;
+    if (!res.ok) {
+      throw new Error(data.error || "Generation failed");
+    }
+
+    const prompts = Array.isArray(data.prompts) ? data.prompts : [data.prompt];
+    
+    // Fill the cards
+    prompts.forEach((p, idx) => {
+        if (idx < cardIds.length) {
+            updateCard(cardIds[idx], p);
+            state.results.push(p);
+        } else {
+            // If AI returned more than requested (unlikely), create new cards
+            const newId = Date.now() + 100 + idx;
+            addPendingCard(newId, idx + 1);
+            updateCard(newId, p);
+            state.results.push(p);
+        }
+    });
+
+    // Handle any cards that didn't get a prompt (if AI returned fewer than requested)
+    if (prompts.length < cardIds.length) {
+        for (let j = prompts.length; j < cardIds.length; j++) {
+            updateCardError(cardIds[j], "AI did not generate this prompt in the batch.");
+        }
+    }
+
+    logToConsole(`Successfully generated ${prompts.length} prompts.`, "success");
     if (state.results.length > 0) copyAllBtn.style.display = "inline-block";
-    
-    // Set 2 second delay to avoid Gemini rate limits
-    await new Promise(r => setTimeout(r, 2000));
+
+  } catch (err) {
+    cardIds.forEach(id => updateCardError(id, err.message));
+    logToConsole(`Batch failed: ${err.message}`, "error");
   }
   
   state.isGenerating = false;

@@ -556,43 +556,52 @@ ${camera ? "- Include professional camera settings (lens, lighting, aperture, et
 // --- SDK HELPERS FOR PROMPT STUDIO & IMG TO PROMPT ---
 
 async function callGeminiWithSDK({ apiKeys, userId, model: modelId, prompt }) {
-  let startIndex = userRotationIndex.get(userId) || 0;
+  let currentIndex = userRotationIndex.get(userId) || 0;
   let attempts = 0;
   const maxAttempts = apiKeys.length;
 
   while (attempts < maxAttempts) {
-    const currentIndex = (startIndex + attempts) % apiKeys.length;
-    const apiKey = apiKeys[currentIndex];
-    userRotationIndex.set(userId, (currentIndex + 1) % apiKeys.length);
+    // Stick to the currentIndex, then offset by attempts if it fails
+    const actualIndex = (currentIndex + attempts) % apiKeys.length;
+    const apiKey = apiKeys[actualIndex];
 
     try {
       const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({ model: modelId });
+      const model = genAI.getGenerativeModel({
+        model: modelId,
+        generationConfig: { temperature: 0.9 } // Increased temperature for diversity
+      });
       
       const result = await model.generateContent(prompt);
       const response = await result.response;
-      return response.text().trim();
+      const text = response.text().trim();
+
+      // Successful? Update the sticky index to this key
+      if (attempts > 0) {
+        userRotationIndex.set(userId, actualIndex);
+      }
+
+      return text;
     } catch (err) {
-      console.error(`[SDK Text] Attempt ${attempts} failed with Key ${currentIndex}: ${err.message}`);
+      console.error(`[SDK Text] Attempt ${attempts} failed with Key ${actualIndex}: ${err.message}`);
       if (err.message.includes("429") || err.message.toLowerCase().includes("quota") || err.message.toLowerCase().includes("limit")) {
         attempts++;
         continue;
       }
-      throw err; // For other errors like 404/400, throw immediately
+      throw err;
     }
   }
   throw new Error("Telah mencoba semua API key namun tetap terkena limit. Silakan tambahkan lebih banyak key.");
 }
 
 async function callGeminiMultimodalWithSDK({ apiKeys, userId, model: modelId, prompt, imageBuffer }) {
-  let startIndex = userRotationIndex.get(userId) || 0;
+  let currentIndex = userRotationIndex.get(userId) || 0;
   let attempts = 0;
   const maxAttempts = apiKeys.length;
 
   while (attempts < maxAttempts) {
-    const currentIndex = (startIndex + attempts) % apiKeys.length;
-    const apiKey = apiKeys[currentIndex];
-    userRotationIndex.set(userId, (currentIndex + 1) % apiKeys.length);
+    const actualIndex = (currentIndex + attempts) % apiKeys.length;
+    const apiKey = apiKeys[actualIndex];
 
     try {
       const genAI = new GoogleGenerativeAI(apiKey);
@@ -608,9 +617,16 @@ async function callGeminiMultimodalWithSDK({ apiKeys, userId, model: modelId, pr
         }
       ]);
       const response = await result.response;
-      return response.text().trim();
+      const text = response.text().trim();
+
+      // Success? Save this index as the new sticky key
+      if (attempts > 0) {
+        userRotationIndex.set(userId, actualIndex);
+      }
+
+      return text;
     } catch (err) {
-      console.error(`[SDK Multimodal] Attempt ${attempts} failed with Key ${currentIndex}: ${err.message}`);
+      console.error(`[SDK Multimodal] Attempt ${attempts} failed with Key ${actualIndex}: ${err.message}`);
       if (err.message.includes("429") || err.message.toLowerCase().includes("quota") || err.message.toLowerCase().includes("limit")) {
         attempts++;
         continue;
@@ -623,8 +639,9 @@ async function callGeminiMultimodalWithSDK({ apiKeys, userId, model: modelId, pr
 
 // --- NEW PROMPT STUDIO ENDPOINT (SDK) ---
 app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
-  const { purpose, object, lang, model } = req.body;
+  const { purpose, object, lang, model, count } = req.body;
   const userId = req.session.userId;
+  const batchSize = Math.max(1, Math.min(20, Number(count || 1)));
 
   if (!purpose || !object) {
     return res.status(400).json({ error: "Purpose and Object are required." });
@@ -636,20 +653,43 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
 
   try {
     const systemPrompt = `You are a professional stock photographer and AI prompt expert.
-Style: Purely realistic photography. NO futuristic.
+Style: Purely realistic photography. NO futuristic/special effects unless requested.
 Purpose: ${purpose}
 Object: ${object}
 Language: ${lang === 'id' ? 'Indonesian' : 'English'}
-Write ONLY the final prompt in ${lang === 'id' ? 'Indonesian' : 'English'}. No explanation.`;
 
-    const prompt = await callGeminiWithSDK({
+Your task: Generate a batch of ${batchSize} UNIQUE and DIVERSE prompts.
+Ensure each prompt has a DIFFERENT activity, setting, camera angle, and lighting mood.
+Example scenarios to vary: morning vs sunset, indoor vs outdoor, action vs portrait, close-up vs wide shot.
+
+CRITICAL: Return ONLY a valid JSON array of strings containing exactly ${batchSize} prompts.
+Format: ["prompt 1...", "prompt 2...", ...]
+Absolutely NO explanations/markdown/intro/outro.`;
+
+    const rawResult = await callGeminiWithSDK({
       apiKeys,
       userId,
       model: model || "gemini-3-flash-preview",
       prompt: systemPrompt
     });
 
-    res.json({ prompt });
+    // Try to parse as array
+    let prompts = [];
+    try {
+      const start = rawResult.indexOf("[");
+      const end = rawResult.lastIndexOf("]");
+      if (start !== -1 && end !== -1 && end > start) {
+        prompts = JSON.parse(rawResult.substring(start, end + 1));
+      } else {
+        // Fallback for non-json response
+        prompts = [rawResult];
+      }
+    } catch (pErr) {
+      console.warn("[PromptStudio] Failed to parse JSON array, using fallback.");
+      prompts = [rawResult];
+    }
+
+    res.json({ prompts });
   } catch (err) {
     console.error(`[PromptStudio SDK] Error: ${err.message}`);
     res.status(500).json({ error: err.message });
