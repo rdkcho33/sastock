@@ -828,8 +828,9 @@ exportButton.addEventListener("click", () => {
     return arr.map(v => `"${clean(v)}"`).join(separator);
   }
 
-  function download(filename, content) {
-    const blob = new Blob(["\uFEFF" + content], { type: "text/csv;charset=utf-8;" });
+  function download(filename, content, useBom = true) {
+    const prefix = useBom ? "\uFEFF" : "";
+    const blob = new Blob([prefix + content], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
     link.download = filename;
@@ -890,21 +891,29 @@ exportButton.addEventListener("click", () => {
   // VECTEEZY
   // ======================
   function exportVecteezy() {
-    const header = ["Filename", "Title", "Description", "Keywords"];
+    function escapeCsvField(value) {
+      const str = String(value || "").replace(/\r?\n/g, " ").trim();
+      if (str.includes('"')) {
+        return `"${str.replace(/"/g, '""')}"`;
+      }
+      if (str.includes(",") || str.includes("\n")) {
+        return `"${str}"`;
+      }
+      return str;
+    }
 
-    const rows = state.files.map(item => [
-      item.file.name,
-      item.title,
-      item.description,
-      (item.keywords || []).join(", ")
-    ]);
+    const header = "Filename,Title,Description,Keywords";
 
-    const csv = [
-      csvRow(header),
-      ...rows.map(r => csvRow(r))
-    ].join("\n");
+    const rows = state.files.map(item => {
+      const filename = String((item.file && item.file.name) || "").trim();
+      const title = escapeCsvField(item.title || "");
+      const description = escapeCsvField(item.description || "");
+      const keywords = escapeCsvField((item.keywords || []).join(","));
+      return `${filename},${title},${description},${keywords}`;
+    });
 
-    download("vecteezy.csv", csv);
+    const csv = [header, ...rows].join("\n");
+    download("vecteezy.csv", csv, false);
   }
 
   // ======================
