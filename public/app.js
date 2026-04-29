@@ -9,6 +9,7 @@ const clearAllButton = document.getElementById("clearAllButton");
 
 const titleLength = document.getElementById("titleLength");
 const titleLengthLabel = document.getElementById("titleLengthLabel");
+const titleLengthNote = document.getElementById("titleLengthNote");
 const keywordCount = document.getElementById("keywordCount");
 const keywordCountLabel = document.getElementById("keywordCountLabel");
 const apiKeysInput = document.getElementById("apiKeysInput");
@@ -24,6 +25,10 @@ const summaryDone = document.getElementById("summaryDone");
 const summaryFailed = document.getElementById("summaryFailed");
 const fileCountLabel = document.getElementById("fileCount");
 const fileSizeLabel = document.getElementById("fileSize");
+
+const PLATFORM_TITLE_LIMITS = {
+  "Adobe Stock": 70
+};
 
 // ImgToPrompt Elements
 const imgToPromptBtn = document.getElementById("imgToPromptBtn");
@@ -613,6 +618,32 @@ function normalizePlatformSelection() {
   return Array.from(document.querySelectorAll(".platformCheckbox:checked")).map((input) => input.value);
 }
 
+function applyTitleLengthConstraints() {
+  const selectedPlatforms = normalizePlatformSelection();
+  const limits = selectedPlatforms
+    .map((platform) => PLATFORM_TITLE_LIMITS[platform])
+    .filter((n) => Number.isFinite(n));
+
+  const defaultMax = 200;
+  const effectiveMax = limits.length ? Math.min(defaultMax, Math.min(...limits)) : defaultMax;
+
+  titleLength.max = String(effectiveMax);
+  if (Number(titleLength.value) > effectiveMax) {
+    titleLength.value = String(effectiveMax);
+  }
+
+  titleLengthLabel.textContent = titleLength.value;
+
+  if (titleLengthNote) {
+    if (limits.length) {
+      const limitingPlatforms = selectedPlatforms.filter((p) => Number.isFinite(PLATFORM_TITLE_LIMITS[p]));
+      titleLengthNote.textContent = `Max title length dibatasi oleh ${limitingPlatforms.join(", ")}: ${effectiveMax} karakter.`;
+    } else {
+      titleLengthNote.textContent = "";
+    }
+  }
+}
+
 function prepareFormData(items) {
   const form = new FormData();
   items.forEach((item) => form.append("files", item.file));
@@ -844,9 +875,28 @@ exportButton.addEventListener("click", () => {
   // ======================
   function exportAdobe() {
     const header = ["Filename", "Title", "Keywords", "Category", "Releases"];
+    const adobeTitleMax = PLATFORM_TITLE_LIMITS["Adobe Stock"] || 70;
+
+    const overLimit = state.files
+      .map((item) => {
+        const sanitizedTitle = clean(item.title).replace(/,/g, "").trim();
+        return { fileName: item.file?.name || "", title: sanitizedTitle };
+      })
+      .filter((item) => item.title.length > adobeTitleMax);
+
+    let shouldTruncate = false;
+    if (overLimit.length) {
+      shouldTruncate = confirm(
+        `Ada ${overLimit.length} title melebihi limit Adobe Stock (${adobeTitleMax} karakter). ` +
+          "Tekan OK untuk truncate otomatis (berisiko), atau Cancel untuk batalkan export."
+      );
+      if (!shouldTruncate) return;
+    }
+
     const rows = state.files.map(item => {
-      // Adobe has 70 char limit and NO COMMAS in title for CSV
-      const title = clean(item.title).replace(/,/g, "").slice(0, 70);
+      // Adobe has strict title limit and NO COMMAS in title for CSV
+      const sanitizedTitle = clean(item.title).replace(/,/g, "").trim();
+      const title = shouldTruncate ? sanitizedTitle.slice(0, adobeTitleMax) : sanitizedTitle;
       const keywords = (item.keywords || []).slice(0, 49).join(", ");
 
       return [
@@ -983,12 +1033,20 @@ clearAllButton.addEventListener("click", () => {
 });
 
 titleLength.addEventListener("input", () => {
-  titleLengthLabel.textContent = titleLength.value;
+  applyTitleLengthConstraints();
 });
 
 keywordCount.addEventListener("input", () => {
   keywordCountLabel.textContent = keywordCount.value;
 });
+
+document.querySelectorAll(".platformCheckbox").forEach((checkbox) => {
+  checkbox.addEventListener("change", () => {
+    applyTitleLengthConstraints();
+  });
+});
+
+applyTitleLengthConstraints();
 
 checkAuth();
 updateSummary();

@@ -489,7 +489,8 @@ File type: ${file.mimetype}
 File extension: ${file.ext}
 
 Requirements:
-- Title length should be around ${requestedTitle} characters.
+- Title MUST be <= ${requestedTitle} characters (count includes spaces). Do NOT exceed this limit.
+- Do NOT cut words in the middle. If the title is too long, remove less important words and keep it natural.
 - Description should be exactly 150 characters.
 - Provide ${requestedKeywords} keywords.
 - Title should be concise, searchable, and buyer-focused.
@@ -726,6 +727,67 @@ async function callGeminiWithRetry({ apiKeys, userId, model, prompt, visualPart,
   };
 }
 
+const PLATFORM_TITLE_LIMITS = {
+  "Adobe Stock": 70
+};
+
+function getEffectiveTitleLength(options) {
+  const base = Math.max(20, Math.min(200, Number(options?.titleLength ?? 80)));
+  const platforms = Array.isArray(options?.platforms) ? options.platforms : [];
+  const limits = platforms.map((platform) => PLATFORM_TITLE_LIMITS[platform]).filter((n) => Number.isFinite(n));
+  if (!limits.length) return base;
+  return Math.min(base, Math.min(...limits));
+}
+
+async function rewriteTitleToMaxLength({
+  apiKeys,
+  userId,
+  model,
+  originalTitle,
+  maxLength,
+  prefix,
+  suffix,
+  platformsLabel,
+  signal
+}) {
+  const prefixInstruction = prefix ? `Use this prefix in the title: "${prefix}".` : "";
+  const suffixInstruction = suffix ? `Use this suffix in the title: "${suffix}".` : "";
+
+  const prompt = [
+    `You are editing a stock content title for ${platformsLabel}.`,
+    "",
+    "Constraints:",
+    `- Title MUST be <= ${maxLength} characters (count includes spaces).`,
+    "- Do NOT cut words in the middle.",
+    "- Keep meaning and searchability.",
+    `- ${prefixInstruction}`,
+    `- ${suffixInstruction}`,
+    "",
+    "Original title:",
+    originalTitle,
+    "",
+    "Return VALID JSON ONLY (no markdown):",
+    '{ "title": "..." }'
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const { text } = await callGeminiWithRotation({
+    apiKeys,
+    userId,
+    model,
+    parts: [{ text: prompt }],
+    signal
+  });
+
+  const parsed = parseResponseText(text);
+  if (!parsed || !parsed.title) {
+    throw new Error("Invalid JSON format from AI (title rewrite)");
+  }
+
+  return String(parsed.title).trim();
+}
+
 app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (req, res) => {
   console.log(`[Metadata] Starting generation for ${req.files?.length || 0} files. User: ${req.session.userId}`);
   const userId = req.session.userId;
@@ -747,6 +809,10 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
     negativeKeywords: req.body.negativeKeywords || "",
     platforms
   };
+
+  // If any selected platform has a strict max title length (e.g. Adobe 70),
+  // clamp here so the AI is instructed correctly and we avoid any UI-side truncation.
+  options.titleLength = getEffectiveTitleLength(options);
 
   if (!apiKeys.length) return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
 
@@ -784,6 +850,31 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
           visualPart,
           signal
         });
+
+        if (result.title && result.title.length > options.titleLength) {
+          const platformsLabel = options.platforms.length ? options.platforms.join(", ") : "microstock platforms";
+          const prefix = options.prefixEnabled && options.prefixText ? options.prefixText.trim() : "";
+          const suffix = options.suffixEnabled && options.suffixText ? options.suffixText.trim() : "";
+
+          const rewritten = await rewriteTitleToMaxLength({
+            apiKeys,
+            userId,
+            model,
+            originalTitle: result.title,
+            maxLength: options.titleLength,
+            prefix,
+            suffix,
+            platformsLabel,
+            signal
+          });
+
+          if (rewritten.length > options.titleLength) {
+            throw new Error(`AI title exceeded max length (${options.titleLength}) even after rewrite`);
+          }
+
+          result.title = rewritten;
+        }
+
         entry.title = result.title;
         entry.description = result.description;
         entry.keywords = result.keywords;
