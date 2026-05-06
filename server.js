@@ -470,7 +470,7 @@ function buildPromptStudioInstruction(payload) {
     .join("\n");
 }
 
-function buildPrompt(file, options) {
+function buildLegacyMetadataPrompt(file, options) {
   const typeHint = file.ext || file.mimetype || "asset";
   const platformLabels = options.platforms.length > 0 ? options.platforms.join(", ") : "microstock platforms";
   const prefix = options.prefixEnabled && options.prefixText ? options.prefixText.trim() : "";
@@ -508,6 +508,63 @@ Create output in valid JSON ONLY, with these fields:
   "categoryShutterstock": "..." // Select 1 or 2 (comma separated) from: Animals/Wildlife, The Arts, Backgrounds/Textures, Beauty/Fashion, Business/Finance, Celebrities, Education, Food and Drink, Healthcare/Medical, Holidays, Industrial, Interiors, Miscellaneous, Nature, Objects, Parks/Outdoor, People, Religion, Science, Signs/Symbols, Sports/Recreation, Technology, Transportation, Vintage
 }
 `;
+}
+
+function buildAiSearchVisibilityPrompt(file, options) {
+  const typeHint = file.ext || file.mimetype || "asset";
+  const prefix = options.prefixEnabled && options.prefixText ? options.prefixText.trim() : "";
+  const suffix = options.suffixEnabled && options.suffixText ? options.suffixText.trim() : "";
+  const prefixInstruction = prefix ? `Use this prefix in the title: "${prefix}".` : "";
+  const suffixInstruction = suffix ? `Use this suffix in the title: "${suffix}".` : "";
+  const negativeTitle = options.negativeTitleWords ? `Avoid these words in the title: ${options.negativeTitleWords}.` : "";
+  const negativeKeywords = options.negativeKeywords ? `Do not include these as keywords: ${options.negativeKeywords}.` : "";
+  const requestedKeywords = Math.max(3, Math.min(49, options.keywordCount));
+  const requestedTitle = Math.max(20, Math.min(70, options.titleLength));
+  const optionalRules = [prefixInstruction, suffixInstruction, negativeTitle, negativeKeywords]
+    .filter(Boolean)
+    .map((line) => `- ${line}`)
+    .join("\n");
+
+  return `You are an Adobe Stock metadata specialist.
+Analyze this image for buyer search intent, not just visual description.
+
+Goal: reduce AI search visibility gap and improve discoverability on Adobe Stock.
+
+Asset type hint: ${typeHint}
+File name: ${file.originalname}
+File type: ${file.mimetype}
+File extension: ${file.ext}
+
+Rules:
+- Use English only.
+- Create one natural title under ${requestedTitle} characters.
+- Do not use brand names, artist names, celebrity names, copyrighted character names, or private property names.
+- Do not keyword spam.
+- Only include things that are visually true or commercially relevant.
+- Put the most important search terms in the first 10 keywords.
+- Include all important title words in the first 10 keywords.
+- Avoid vague words like beautiful, nice, amazing, high quality.
+- Prefer buyer search phrases over single generic words.
+- Make metadata suitable for Adobe Stock buyers.
+- Description should be exactly 150 characters.
+- Provide ${requestedKeywords} keywords (max 49).
+${optionalRules}
+
+Return VALID JSON ONLY (no markdown) with these fields:
+{
+  "title": "...",
+  "description": "...",
+  "keywords": ["...", "...", "..."],
+  "categoryAdobe": number,
+  "categoryShutterstock": "..."
+}`;
+}
+
+function buildPrompt(file, options) {
+  if (options?.promptProfile === "ai_search_visibility") {
+    return buildAiSearchVisibilityPrompt(file, options);
+  }
+  return buildLegacyMetadataPrompt(file, options);
 }
 
 function parseResponseText(text) {
@@ -796,11 +853,14 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
   const model = req.body.model || "gemini-3-flash-preview";
   const titleLength = Number(req.body.titleLength ?? 80);
   const keywordCount = Number(req.body.keywordCount ?? 12);
+  const promptProfileRaw = String(req.body.promptProfile || "legacy");
+  const promptProfile = promptProfileRaw === "ai_search_visibility" ? promptProfileRaw : "legacy";
   const platforms = Array.isArray(req.body.platforms) ? req.body.platforms : [req.body.platforms].filter(Boolean);
 
   const options = {
     titleLength,
     keywordCount,
+    promptProfile,
     prefixEnabled: req.body.prefixEnabled === "true" || req.body.prefixEnabled === "on",
     prefixText: req.body.prefixText || "",
     suffixEnabled: req.body.suffixEnabled === "true" || req.body.suffixEnabled === "on",
@@ -813,6 +873,10 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
   // If any selected platform has a strict max title length (e.g. Adobe 70),
   // clamp here so the AI is instructed correctly and we avoid any UI-side truncation.
   options.titleLength = getEffectiveTitleLength(options);
+  if (options.promptProfile === "ai_search_visibility") {
+    options.titleLength = Math.min(options.titleLength, PLATFORM_TITLE_LIMITS["Adobe Stock"] || 70);
+    options.keywordCount = Math.max(3, Math.min(49, options.keywordCount));
+  }
 
   if (!apiKeys.length) return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
 

@@ -18,6 +18,7 @@ const prefixEnabled = document.getElementById("prefixEnabled");
 const prefixText = document.getElementById("prefixText");
 const suffixEnabled = document.getElementById("suffixEnabled");
 const suffixText = document.getElementById("suffixText");
+const aiSearchVisibilityEnabled = document.getElementById("aiSearchVisibilityEnabled");
 const negativeTitleWords = document.getElementById("negativeTitleWords");
 const negativeKeywords = document.getElementById("negativeKeywords");
 const summaryFiles = document.getElementById("summaryFiles");
@@ -29,6 +30,12 @@ const fileSizeLabel = document.getElementById("fileSize");
 const PLATFORM_TITLE_LIMITS = {
   "Adobe Stock": 70
 };
+
+const METADATA_PROMPT_PROFILE_STORAGE_KEY = "sastock_metadata_prompt_profile";
+
+function getPromptProfileFromUI() {
+  return aiSearchVisibilityEnabled && aiSearchVisibilityEnabled.checked ? "ai_search_visibility" : "legacy";
+}
 
 // ImgToPrompt Elements
 const imgToPromptBtn = document.getElementById("imgToPromptBtn");
@@ -618,6 +625,16 @@ function normalizePlatformSelection() {
   return Array.from(document.querySelectorAll(".platformCheckbox:checked")).map((input) => input.value);
 }
 
+function applyKeywordCountConstraints() {
+  const aiMode = !!(aiSearchVisibilityEnabled && aiSearchVisibilityEnabled.checked);
+  const maxKeywords = aiMode ? 49 : 50;
+  keywordCount.max = String(maxKeywords);
+  if (Number(keywordCount.value) > maxKeywords) {
+    keywordCount.value = String(maxKeywords);
+  }
+  keywordCountLabel.textContent = keywordCount.value;
+}
+
 function applyTitleLengthConstraints() {
   const selectedPlatforms = normalizePlatformSelection();
   const limits = selectedPlatforms
@@ -625,7 +642,10 @@ function applyTitleLengthConstraints() {
     .filter((n) => Number.isFinite(n));
 
   const defaultMax = 200;
-  const effectiveMax = limits.length ? Math.min(defaultMax, Math.min(...limits)) : defaultMax;
+  let effectiveMax = limits.length ? Math.min(defaultMax, Math.min(...limits)) : defaultMax;
+  if (aiSearchVisibilityEnabled && aiSearchVisibilityEnabled.checked) {
+    effectiveMax = Math.min(effectiveMax, PLATFORM_TITLE_LIMITS["Adobe Stock"] || 70);
+  }
 
   titleLength.max = String(effectiveMax);
   if (Number(titleLength.value) > effectiveMax) {
@@ -653,6 +673,7 @@ function prepareFormData(items) {
   form.append("model", modelSelect.value);
   form.append("titleLength", titleLength.value);
   form.append("keywordCount", keywordCount.value);
+  form.append("promptProfile", getPromptProfileFromUI());
   form.append("prefixEnabled", prefixEnabled.checked);
   form.append("prefixText", prefixText.value);
   form.append("suffixEnabled", suffixEnabled.checked);
@@ -718,6 +739,7 @@ async function runGeneration(items) {
       form.append("model", modelSelect.value);
       form.append("titleLength", titleLength.value);
       form.append("keywordCount", keywordCount.value);
+      form.append("promptProfile", getPromptProfileFromUI());
       form.append("prefixEnabled", prefixEnabled.checked);
       form.append("prefixText", prefixText.value);
       form.append("suffixEnabled", suffixEnabled.checked);
@@ -1039,6 +1061,19 @@ titleLength.addEventListener("input", () => {
 keywordCount.addEventListener("input", () => {
   keywordCountLabel.textContent = keywordCount.value;
 });
+
+if (aiSearchVisibilityEnabled) {
+  const savedProfile = localStorage.getItem(METADATA_PROMPT_PROFILE_STORAGE_KEY);
+  aiSearchVisibilityEnabled.checked = savedProfile === "ai_search_visibility";
+  applyKeywordCountConstraints();
+  applyTitleLengthConstraints();
+
+  aiSearchVisibilityEnabled.addEventListener("change", () => {
+    localStorage.setItem(METADATA_PROMPT_PROFILE_STORAGE_KEY, getPromptProfileFromUI());
+    applyKeywordCountConstraints();
+    applyTitleLengthConstraints();
+  });
+}
 
 document.querySelectorAll(".platformCheckbox").forEach((checkbox) => {
   checkbox.addEventListener("change", () => {
