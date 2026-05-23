@@ -19,6 +19,7 @@ const prefixText = document.getElementById("prefixText");
 const suffixEnabled = document.getElementById("suffixEnabled");
 const suffixText = document.getElementById("suffixText");
 const aiSearchVisibilityEnabled = document.getElementById("aiSearchVisibilityEnabled");
+const exportForceEps = document.getElementById("exportForceEps");
 const negativeTitleWords = document.getElementById("negativeTitleWords");
 const negativeKeywords = document.getElementById("negativeKeywords");
 const summaryFiles = document.getElementById("summaryFiles");
@@ -32,6 +33,7 @@ const PLATFORM_TITLE_LIMITS = {
 };
 
 const METADATA_PROMPT_PROFILE_STORAGE_KEY = "sastock_metadata_prompt_profile";
+const EXPORT_FORCE_EPS_STORAGE_KEY = "sastock_export_force_eps";
 
 function getPromptProfileFromUI() {
   return aiSearchVisibilityEnabled && aiSearchVisibilityEnabled.checked ? "ai_search_visibility" : "legacy";
@@ -892,6 +894,24 @@ exportButton.addEventListener("click", () => {
     link.remove();
   }
 
+  function maybeForceEpsExtension(filename) {
+    const raw = String(filename || "").trim();
+    if (!raw) return raw;
+    if (!(exportForceEps && exportForceEps.checked)) return raw;
+
+    if (raw.toLowerCase().endsWith(".eps")) {
+      return raw;
+    }
+
+    const lastDot = raw.lastIndexOf(".");
+    const base = lastDot > 0 ? raw.slice(0, lastDot) : raw;
+    return `${base}.eps`;
+  }
+
+  function exportFilenameForItem(item) {
+    return maybeForceEpsExtension(item && item.file && item.file.name);
+  }
+
   // ======================
   // ADOBE STOCK
   // ======================
@@ -922,7 +942,7 @@ exportButton.addEventListener("click", () => {
       const keywords = (item.keywords || []).slice(0, 49).join(", ");
 
       return [
-        item.file.name,
+        exportFilenameForItem(item),
         title,
         keywords,
         item.categoryAdobe || "11", // default to 11 (Landscape) if missing
@@ -947,7 +967,7 @@ exportButton.addEventListener("click", () => {
 
     const rows = state.files.map(item => {
       // Columns 1-4 are quoted text, 5-7 are unquoted booleans
-      const fName = `"${clean(item.file.name)}"`;
+      const fName = `"${clean(exportFilenameForItem(item))}"`;
       const desc = `"${clean(item.description || "")}"`;
       const keyw = `"${(item.keywords || []).slice(0, 50).join(", ")}"`;
       const cats = `"${item.categoryShutterstock || "People"}"`;
@@ -977,7 +997,7 @@ exportButton.addEventListener("click", () => {
     const header = "Filename,Title,Description,Keywords";
 
     const rows = state.files.map(item => {
-      const filename = String((item.file && item.file.name) || "").trim();
+      const filename = String(exportFilenameForItem(item) || "").trim();
       const title = escapeCsvField(item.title || "");
       const description = escapeCsvField(item.description || "");
       const keywords = escapeCsvField((item.keywords || []).join(","));
@@ -995,7 +1015,7 @@ exportButton.addEventListener("click", () => {
     const header = ["File name", "Title", "Keywords", "Prompt", "Model"];
 
     const rows = state.files.map(item => [
-      item.file.name,
+      exportFilenameForItem(item),
       item.title,
       (item.keywords || []).join(", ") + ", _ai_generated",
       item.description || "",
@@ -1072,6 +1092,13 @@ if (aiSearchVisibilityEnabled) {
     localStorage.setItem(METADATA_PROMPT_PROFILE_STORAGE_KEY, getPromptProfileFromUI());
     applyKeywordCountConstraints();
     applyTitleLengthConstraints();
+  });
+}
+
+if (exportForceEps) {
+  exportForceEps.checked = localStorage.getItem(EXPORT_FORCE_EPS_STORAGE_KEY) === "1";
+  exportForceEps.addEventListener("change", () => {
+    localStorage.setItem(EXPORT_FORCE_EPS_STORAGE_KEY, exportForceEps.checked ? "1" : "0");
   });
 }
 
