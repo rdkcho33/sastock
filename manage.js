@@ -41,9 +41,10 @@ async function main() {
       break;
 
     case "add-key":
-      const [username, keyLabel, keyValue] = args.slice(1);
+      const [username, keyLabel, keyValue, providerRaw] = args.slice(1);
+      const provider = String(providerRaw || "gemini").trim().toLowerCase() === "snifox" ? "snifox" : "gemini";
       if (!username || !keyLabel || !keyValue) {
-        console.log("Usage: node manage.js add-key <username> <label> <api_key>");
+        console.log("Usage: node manage.js add-key <username> <label> <api_key> [gemini|snifox]");
         return;
       }
       try {
@@ -52,9 +53,9 @@ async function main() {
           console.log(`User '${username}' not found.`);
           return;
         }
-        db.prepare("INSERT INTO api_keys (user_id, label, key_value) VALUES (?, ?, ?)")
-          .run(user.id, keyLabel, keyValue);
-        console.log(`Successfully added key '${keyLabel}' for user ${username}.`);
+        db.prepare("INSERT INTO api_keys (user_id, provider, label, key_value) VALUES (?, ?, ?, ?)")
+          .run(user.id, provider, keyLabel, keyValue);
+        console.log(`Successfully added ${provider} key '${keyLabel}' for user ${username}.`);
       } catch (err) {
         console.error("Error adding key:", err.message);
       }
@@ -63,7 +64,7 @@ async function main() {
     case "list-keys":
       try {
         const keys = db.prepare(`
-          SELECT k.id, u.username, k.label, k.key_value, k.created_at 
+          SELECT k.id, u.username, k.provider, k.label, k.key_value, k.created_at 
           FROM api_keys k 
           JOIN users u ON k.user_id = u.id
         `).all();

@@ -34,6 +34,13 @@ const PLATFORM_TITLE_LIMITS = {
 
 const METADATA_PROMPT_PROFILE_STORAGE_KEY = "sastock_metadata_prompt_profile";
 const EXPORT_FORCE_EPS_STORAGE_KEY = "sastock_export_force_eps";
+const PROVIDER_STORAGE_KEY = "sastock_provider";
+const SNIFOX_MODEL_STORAGE_KEY = "sastock_snifox_model";
+const PROVIDERS = {
+  GEMINI: "gemini",
+  SNIFOX: "snifox"
+};
+const DEFAULT_SNIFOX_MODEL = "google/gemini-2.5-flash";
 
 function getPromptProfileFromUI() {
   return aiSearchVisibilityEnabled && aiSearchVisibilityEnabled.checked ? "ai_search_visibility" : "legacy";
@@ -98,12 +105,101 @@ document.querySelector(".log-header").onclick = () => {
 const state = {
   files: [],
   user: null,
-  keys: [],
+  provider: localStorage.getItem(PROVIDER_STORAGE_KEY) === PROVIDERS.SNIFOX ? PROVIDERS.SNIFOX : PROVIDERS.GEMINI,
+  keyModalProvider: localStorage.getItem(PROVIDER_STORAGE_KEY) === PROVIDERS.SNIFOX ? PROVIDERS.SNIFOX : PROVIDERS.GEMINI,
+  keysByProvider: {
+    [PROVIDERS.GEMINI]: [],
+    [PROVIDERS.SNIFOX]: []
+  },
   activeKey: null,
   isGenerating: false,
   stopRequested: false,
   activeController: null
 };
+
+function getProviderLabel(provider = state.provider) {
+  return provider === PROVIDERS.SNIFOX ? "Snifox" : "Gemini";
+}
+
+function getMetadataEndpoint() {
+  return state.provider === PROVIDERS.SNIFOX ? "/api/snifox/generate" : "/api/generate";
+}
+
+function getCurrentKeys() {
+  return state.keysByProvider[state.provider] || [];
+}
+
+function getModalKeys() {
+  return state.keysByProvider[state.keyModalProvider] || [];
+}
+
+function getActiveModel() {
+  if (state.provider === PROVIDERS.SNIFOX) {
+    return document.getElementById("snifoxModelInput")?.value.trim() || DEFAULT_SNIFOX_MODEL;
+  }
+  return modelSelect.value;
+}
+
+function updateProviderButtons(containerId, activeProvider) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  container.querySelectorAll("[data-provider]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.provider === activeProvider);
+  });
+}
+
+function updateProviderUI() {
+  const isSnifox = state.provider === PROVIDERS.SNIFOX;
+  const subtitle = document.getElementById("providerSubtitle");
+  const providerHint = document.getElementById("providerHint");
+  const apiKeySectionLabel = document.getElementById("apiKeySectionLabel");
+  const geminiModelGroup = document.getElementById("geminiModelGroup");
+  const snifoxModelGroup = document.getElementById("snifoxModelGroup");
+
+  updateProviderButtons("providerToggle", state.provider);
+  if (subtitle) {
+    subtitle.textContent = isSnifox ? "Snifox Aggregator Active" : "Google Gemini Direct Active";
+  }
+  if (providerHint) {
+    providerHint.textContent = isSnifox
+      ? "Menggunakan endpoint aggregator Snifox yang kompatibel dengan OpenAI."
+      : "Menggunakan endpoint Google Gemini langsung.";
+  }
+  if (apiKeySectionLabel) {
+    apiKeySectionLabel.textContent = `${getProviderLabel()} API Keys (Saved in Account)`;
+  }
+  if (geminiModelGroup) geminiModelGroup.hidden = isSnifox;
+  if (snifoxModelGroup) snifoxModelGroup.hidden = !isSnifox;
+
+  localStorage.setItem(PROVIDER_STORAGE_KEY, state.provider);
+  state.keyModalProvider = state.provider;
+  updateKeyModalProviderUI();
+  if (state.user) {
+    fetchKeys(state.provider);
+  }
+}
+
+function updateKeyModalProviderUI() {
+  const isSnifox = state.keyModalProvider === PROVIDERS.SNIFOX;
+  const batchKeysLabel = document.getElementById("batchKeysLabel");
+  const keyModalSubtitle = document.getElementById("keyModalSubtitle");
+  const batchKeys = document.getElementById("batchKeys");
+
+  updateProviderButtons("keyProviderToggle", state.keyModalProvider);
+  if (batchKeysLabel) {
+    batchKeysLabel.textContent = `Batch Add ${getProviderLabel(state.keyModalProvider)} API Keys (one per line)`;
+  }
+  if (keyModalSubtitle) {
+    keyModalSubtitle.textContent = isSnifox
+      ? "Simpan key Snifox terpisah dari key Gemini"
+      : "Simpan key Gemini terpisah dari key Snifox";
+  }
+  if (batchKeys) {
+    batchKeys.placeholder = isSnifox ? "snfx-xxxx\nsnfx-yyyy" : "key1\nkey2\nkey3";
+  }
+  renderKeyList();
+}
 
 // --- AUTH & INITIALIZATION ---
 
@@ -131,25 +227,29 @@ async function checkAuth() {
        await fetchUsers();
     }
 
-    await fetchKeys();
+    await fetchKeys(state.provider);
   } catch (err) {
     console.error("Auth check failed", err);
     window.location.href = "/login.html";
   }
 }
 
-async function fetchKeys() {
+async function fetchKeys(provider = state.provider) {
   try {
-    const res = await fetch("/api/keys");
+    const res = await fetch(`/api/keys?provider=${encodeURIComponent(provider)}`);
     const contentType = res.headers.get("content-type") || "";
     const raw = await res.text();
     if (!contentType.includes("application/json")) {
       throw new Error(`Expected JSON but got: ${raw.slice(0, 200)}`);
     }
     const data = JSON.parse(raw);
-    state.keys = data.keys;
-    renderKeySelector();
-    renderKeyList();
+    state.keysByProvider[provider] = Array.isArray(data.keys) ? data.keys : [];
+    if (provider === state.provider) {
+      renderKeySelector();
+    }
+    if (provider === state.keyModalProvider) {
+      renderKeyList();
+    }
   } catch (err) {
     console.error("Failed to fetch keys", err);
   }
@@ -158,23 +258,25 @@ async function fetchKeys() {
 function renderKeySelector() {
   const select = document.getElementById("activeKeySelect");
   const counter = document.getElementById("apiKeyCounter");
+  const keys = getCurrentKeys();
   
-  if (state.keys.length === 0) {
-    select.innerHTML = '<option value="">No keys saved</option>';
+  if (keys.length === 0) {
+    select.innerHTML = `<option value="">No ${getProviderLabel()} keys saved</option>`;
     counter.textContent = "0 keys available";
     return;
   }
 
-  select.innerHTML = state.keys.map(k => `
+  select.innerHTML = keys.map(k => `
     <option value="${k.key_value}">${k.label} (${k.key_value.substring(0, 4)}...${k.key_value.substring(k.key_value.length - 4)})</option>
   `).join("");
   
-  counter.textContent = `${state.keys.length} keys available`;
+  counter.textContent = `${keys.length} keys available`;
 }
 
 function renderKeyList() {
   const list = document.getElementById("keyList");
-  list.innerHTML = state.keys.map(k => `
+  const keys = getModalKeys();
+  list.innerHTML = keys.map(k => `
     <div class="key-item">
       <div class="key-item-info">
         <span class="key-item-label">${k.label}</span>
@@ -191,7 +293,10 @@ window.deleteKey = async (id) => {
   if (!confirm("Are you sure you want to delete this key?")) return;
   try {
     await fetch(`/api/keys/${id}`, { method: "DELETE" });
-    await fetchKeys();
+    await fetchKeys(state.provider);
+    if (state.keyModalProvider !== state.provider) {
+      await fetchKeys(state.keyModalProvider);
+    }
   } catch (err) {
     alert("Failed to delete key");
   }
@@ -203,7 +308,12 @@ const manageKeysBtn = document.getElementById("manageKeysBtn");
 const closeKeyModal = document.getElementById("closeKeyModal");
 const addKeyForm = document.getElementById("addKeyForm");
 
-manageKeysBtn.onclick = () => keyModal.classList.add("active");
+manageKeysBtn.onclick = async () => {
+  state.keyModalProvider = state.provider;
+  updateKeyModalProviderUI();
+  await fetchKeys(state.keyModalProvider);
+  keyModal.classList.add("active");
+};
 closeKeyModal.onclick = () => keyModal.classList.remove("active");
 
 addKeyForm.onsubmit = async (e) => {
@@ -211,13 +321,13 @@ addKeyForm.onsubmit = async (e) => {
   const rawValue = document.getElementById("batchKeys").value;
   const keys = rawValue.split("\n").map(k => k.trim()).filter(Boolean);
   
-  if (keys.length === 0) return alert("Please enter at least one key.");
+  if (keys.length === 0) return alert(`Please enter at least one ${getProviderLabel(state.keyModalProvider)} key.`);
 
   try {
     const res = await fetch("/api/keys", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ keys })
+      body: JSON.stringify({ keys, provider: state.keyModalProvider })
     });
     
     const contentType = res.headers.get("content-type") || "";
@@ -229,7 +339,10 @@ addKeyForm.onsubmit = async (e) => {
     
     if (res.ok) {
       addKeyForm.reset();
-      await fetchKeys();
+      await fetchKeys(state.keyModalProvider);
+      if (state.provider !== state.keyModalProvider) {
+        await fetchKeys(state.provider);
+      }
       // Close modal on success for better UX
       keyModal.classList.remove("active");
     } else {
@@ -245,6 +358,25 @@ document.getElementById("logoutBtn").onclick = async () => {
   await fetch("/api/auth/logout", { method: "POST" });
   window.location.href = "/login.html";
 };
+
+document.getElementById("providerToggle")?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-provider]");
+  if (!button) return;
+  state.provider = button.dataset.provider === PROVIDERS.SNIFOX ? PROVIDERS.SNIFOX : PROVIDERS.GEMINI;
+  updateProviderUI();
+});
+
+document.getElementById("keyProviderToggle")?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-provider]");
+  if (!button) return;
+  state.keyModalProvider = button.dataset.provider === PROVIDERS.SNIFOX ? PROVIDERS.SNIFOX : PROVIDERS.GEMINI;
+  updateKeyModalProviderUI();
+  await fetchKeys(state.keyModalProvider);
+});
+
+document.getElementById("snifoxModelInput")?.addEventListener("input", (event) => {
+  localStorage.setItem(SNIFOX_MODEL_STORAGE_KEY, event.target.value);
+});
 
 // --- ADMIN HANDLERS ---
 const adminModal = document.getElementById("adminModal");
@@ -713,8 +845,14 @@ function escapeCsv(value) {
 }
 
 async function runGeneration(items) {
-  if (state.keys.length === 0) {
-    alert("You haven't saved any Gemini API Keys yet. Click 'Manage' to add one.");
+  if (getCurrentKeys().length === 0) {
+    alert(`You haven't saved any ${getProviderLabel()} API Keys yet. Click 'Manage' to add one.`);
+    return;
+  }
+
+  const activeModel = getActiveModel();
+  if (!activeModel) {
+    alert(`Please fill in the ${getProviderLabel()} model first.`);
     return;
   }
 
@@ -734,11 +872,11 @@ async function runGeneration(items) {
       if (state.stopRequested) break;
 
       activeItem = item;
-      logToConsole(`File "${item.file.name}": Uploading and processing...`, "info");
+      logToConsole(`File "${item.file.name}": Uploading and processing via ${getProviderLabel()}...`, "info");
 
       const form = new FormData();
       form.append("files", item.file);
-      form.append("model", modelSelect.value);
+      form.append("model", activeModel);
       form.append("titleLength", titleLength.value);
       form.append("keywordCount", keywordCount.value);
       form.append("promptProfile", getPromptProfileFromUI());
@@ -756,7 +894,7 @@ async function runGeneration(items) {
       updateSummary();
 
       try {
-        const response = await fetch("/api/generate", {
+        const response = await fetch(getMetadataEndpoint(), {
           method: "POST",
           body: form,
           signal: state.activeController.signal
@@ -780,7 +918,7 @@ async function runGeneration(items) {
         item.categoryAdobe = result.categoryAdobe;
         item.categoryShutterstock = result.categoryShutterstock;
         
-        logToConsole(`File "${item.file.name}": Successfully generated!`, "success");
+        logToConsole(`File "${item.file.name}": Successfully generated via ${getProviderLabel()}!`, "success");
       } catch (error) {
         if (error.name === "AbortError" || state.stopRequested) {
           item.status = "pending";
@@ -1108,7 +1246,12 @@ document.querySelectorAll(".platformCheckbox").forEach((checkbox) => {
   });
 });
 
+if (document.getElementById("snifoxModelInput")) {
+  document.getElementById("snifoxModelInput").value = localStorage.getItem(SNIFOX_MODEL_STORAGE_KEY) || DEFAULT_SNIFOX_MODEL;
+}
+
 applyTitleLengthConstraints();
+updateProviderUI();
 
 checkAuth();
 updateSummary();

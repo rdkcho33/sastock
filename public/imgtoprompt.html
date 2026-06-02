@@ -20,7 +20,7 @@
             </div>
             <div>
               <h1>Studio</h1>
-              <p>Image to Prompt</p>
+              <p id="providerSubtitle">Dual LLM Endpoints</p>
             </div>
           </div>
           
@@ -55,15 +55,39 @@
         <hr class="divider" />
 
         <div class="gemini-settings" style="margin-top: 20px;">
+          <label>Endpoint Provider</label>
+          <div class="provider-toggle" id="providerToggle">
+            <button type="button" class="provider-btn active" data-provider="gemini">Gemini Direct</button>
+            <button type="button" class="provider-btn" data-provider="snifox">Snifox Gateway</button>
+          </div>
+          <div id="providerHint" class="provider-hint">Menggunakan endpoint Google Gemini langsung.</div>
+
+          <label id="apiKeySectionLabel" class="section-label">Gemini API Keys</label>
+          <select id="activeKeySelect" class="key-selector">
+            <option value="">Fetch API keys...</option>
+          </select>
+          <div id="apiKeyCounter" class="text-muted" style="font-size: 11px; margin-top: 4px;">0 keys available</div>
+
           <label class="section-label flex-between">
-            <span>MODEL</span>
+            <span id="modelSectionTitle">MODEL</span>
             <span class="value-badge">Free Tier</span>
           </label>
-          <select id="modelSelect" class="key-selector">
-            <option value="gemini-3-flash-preview" selected>gemini-3-flash-preview</option>
-            <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-            <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
-          </select>
+          <div id="geminiModelGroup" class="provider-model-group">
+            <select id="modelSelect" class="key-selector">
+              <option value="gemini-3-flash-preview" selected>gemini-3-flash-preview</option>
+              <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+              <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+            </select>
+          </div>
+
+          <div id="snifoxModelGroup" class="provider-model-group" hidden>
+            <input id="snifoxModelInput" type="text" class="key-selector" list="snifoxModelSuggestions" placeholder="google/gemini-2.5-flash" />
+            <datalist id="snifoxModelSuggestions">
+              <option value="google/gemini-2.5-flash"></option>
+              <option value="openai/gpt-5.2"></option>
+            </datalist>
+            <div class="provider-hint">Preset siap pakai: google/gemini-2.5-flash dan openai/gpt-5.2.</div>
+          </div>
 
           <label class="section-label flex-between" style="margin-top: 15px;">
             <span>CREATIVITY</span>

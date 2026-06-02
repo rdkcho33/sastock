@@ -47,6 +47,17 @@ app.use(
 
 app.use(express.static(path.join(__dirname, "public")));
 
+const PROVIDERS = {
+  GEMINI: "gemini",
+  SNIFOX: "snifox"
+};
+
+const SNIFOX_BASE_URL = "https://core.snifoxai.com/v1/chat/completions";
+const DEFAULT_GEMINI_METADATA_MODEL = "gemini-3-flash-preview";
+const DEFAULT_GEMINI_PROMPT_STUDIO_MODEL = "gemini-2.5-flash";
+const DEFAULT_GEMINI_IMGTOPROMPT_MODEL = "gemini-3-flash-preview";
+const DEFAULT_SNIFOX_MODEL = "google/gemini-2.5-flash";
+
 function buildGhostscriptPngCommand(inputPath, outputPath) {
   return `${GHOSTSCRIPT_BIN} -dSAFER -dBATCH -dNOPAUSE -dNOPROMPT -dEPSCrop -sDEVICE=png16m -r300 -sOutputFile="${outputPath}" "${inputPath}"`;
 }
@@ -125,6 +136,20 @@ app.get("/api/auth/me", (req, res) => {
 const userRotationIndex = new Map();
 const userProcessControllers = new Map();
 
+function normalizeProvider(value) {
+  return String(value || "").trim().toLowerCase() === PROVIDERS.SNIFOX
+    ? PROVIDERS.SNIFOX
+    : PROVIDERS.GEMINI;
+}
+
+function getProviderLabel(provider) {
+  return provider === PROVIDERS.SNIFOX ? "Snifox" : "Gemini";
+}
+
+function getRotationStateKey(userId, provider = PROVIDERS.GEMINI) {
+  return `${provider}:${userId}`;
+}
+
 function getProcessStateKey(userId, tool) {
   return `${userId}:${tool}`;
 }
@@ -172,27 +197,28 @@ function finishUserProcess(userId, tool, controller) {
   }
 }
 
-function getNormalizedRotationIndex(userId, totalKeys) {
+function getNormalizedRotationIndex(userId, totalKeys, provider = PROVIDERS.GEMINI) {
   if (!totalKeys) return 0;
-  const rawIndex = Number(userRotationIndex.get(userId) || 0);
+  const rawIndex = Number(userRotationIndex.get(getRotationStateKey(userId, provider)) || 0);
   if (!Number.isFinite(rawIndex) || rawIndex < 0) return 0;
   return rawIndex % totalKeys;
 }
 
-function setRotationIndex(userId, index, totalKeys) {
+function setRotationIndex(userId, index, totalKeys, provider = PROVIDERS.GEMINI) {
+  const rotationKey = getRotationStateKey(userId, provider);
   if (!totalKeys) {
-    userRotationIndex.set(userId, 0);
+    userRotationIndex.set(rotationKey, 0);
     return;
   }
 
   const normalized = ((Number(index) || 0) % totalKeys + totalKeys) % totalKeys;
-  userRotationIndex.set(userId, normalized);
+  userRotationIndex.set(rotationKey, normalized);
 }
 
-function getUserApiKeys(userId) {
+function getUserApiKeys(userId, provider = PROVIDERS.GEMINI) {
   return db
-    .prepare("SELECT key_value FROM api_keys WHERE user_id = ? ORDER BY id ASC")
-    .all(userId)
+    .prepare("SELECT key_value FROM api_keys WHERE user_id = ? AND provider = ? ORDER BY id ASC")
+    .all(userId, normalizeProvider(provider))
     .map((item) => String(item.key_value || "").trim())
     .filter(Boolean);
 }
@@ -246,14 +272,16 @@ app.post("/api/convert-vector", isAuthenticated, upload.single("file"), async (r
 // --- KEY MANAGEMENT ROUTES ---
 
 app.get("/api/keys", isAuthenticated, (req, res) => {
+  const provider = normalizeProvider(req.query.provider);
   const keys = db
-    .prepare("SELECT id, key_value, label FROM api_keys WHERE user_id = ? ORDER BY id ASC")
-    .all(req.session.userId);
+    .prepare("SELECT id, key_value, label, provider FROM api_keys WHERE user_id = ? AND provider = ? ORDER BY id ASC")
+    .all(req.session.userId, provider);
   res.json({ keys });
 });
 
 app.post("/api/keys", isAuthenticated, (req, res) => {
   const { key, keys, label } = req.body;
+  const provider = normalizeProvider(req.body.provider);
   
   // Support both single key and array of keys
   const keysToInsert = keys && Array.isArray(keys) ? keys : (key ? [key] : []);
@@ -262,18 +290,18 @@ app.post("/api/keys", isAuthenticated, (req, res) => {
     return res.status(400).json({ error: "No API keys provided" });
   }
 
-  const stmt = db.prepare("INSERT INTO api_keys (user_id, key_value, label) VALUES (?, ?, ?)");
+  const stmt = db.prepare("INSERT INTO api_keys (user_id, provider, key_value, label) VALUES (?, ?, ?, ?)");
   
   // Use a transaction for batch insert
-  const insertMany = db.transaction((userId, items) => {
+  const insertMany = db.transaction((userId, providerName, items) => {
     for (const k of items) {
-      stmt.run(userId, k, label || `Key ${k.substring(0, 4)}...`);
+      stmt.run(userId, providerName, k, label || `Key ${k.substring(0, 4)}...`);
     }
   });
 
   try {
-    insertMany(req.session.userId, keysToInsert);
-    res.json({ success: true, count: keysToInsert.length });
+    insertMany(req.session.userId, provider, keysToInsert);
+    res.json({ success: true, count: keysToInsert.length, provider });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -387,6 +415,9 @@ function isInvalidKeyError(status, bodyText) {
     status === 403 ||
     text.includes("api key not valid") ||
     text.includes("invalid api key") ||
+    text.includes("incorrect api key") ||
+    text.includes("invalid_api_key") ||
+    text.includes("unauthorized") ||
     text.includes("permission")
   );
 }
@@ -751,6 +782,108 @@ async function callGeminiWithRotation({
   throw new Error(`Semua API key gagal dipakai. Terakhir: ${truncateText(lastErrorText)}`);
 }
 
+function extractOpenAIMessageText(payload) {
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content === "string") {
+    return content.trim();
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (item?.type === "text") return item.text || "";
+        return "";
+      })
+      .join("")
+      .trim();
+  }
+
+  return "";
+}
+
+async function callSnifoxWithRotation({
+  apiKeys,
+  userId,
+  model,
+  messages,
+  temperature = 0.7,
+  responseFormat,
+  signal
+}) {
+  const totalKeys = apiKeys.length;
+  if (!totalKeys) {
+    throw new Error("Masukkan minimal satu API key Snifox.");
+  }
+
+  if (!String(model || "").trim()) {
+    throw new Error("Model Snifox wajib diisi.");
+  }
+
+  const provider = PROVIDERS.SNIFOX;
+  let currentIndex = getNormalizedRotationIndex(userId, totalKeys, provider);
+  let attempts = 0;
+  let lastErrorText = "";
+
+  while (attempts < totalKeys) {
+    assertProcessActive(signal);
+
+    const activeIndex = currentIndex % totalKeys;
+    const apiKey = apiKeys[activeIndex];
+
+    try {
+      const response = await fetch(SNIFOX_BASE_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`
+        },
+        signal,
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature,
+          ...(responseFormat ? { response_format: responseFormat } : {})
+        })
+      });
+
+      const rawText = await response.text();
+      lastErrorText = rawText;
+
+      if (!response.ok) {
+        if (isLimitError(response.status, rawText) || isInvalidKeyError(response.status, rawText)) {
+          attempts += 1;
+          currentIndex = (activeIndex + 1) % totalKeys;
+          setRotationIndex(userId, currentIndex, totalKeys, provider);
+          continue;
+        }
+
+        throw new Error(`Snifox failed: ${response.status} ${truncateText(rawText)}`);
+      }
+
+      const parsedResponse = JSON.parse(rawText);
+      const outputText = extractOpenAIMessageText(parsedResponse);
+
+      setRotationIndex(userId, activeIndex, totalKeys, provider);
+      return { text: outputText, keyIndex: activeIndex };
+    } catch (error) {
+      if (isAbortLikeError(error)) {
+        throw createStopError();
+      }
+
+      if (attempts === totalKeys - 1) {
+        throw error;
+      }
+
+      attempts += 1;
+      currentIndex = (activeIndex + 1) % totalKeys;
+      setRotationIndex(userId, currentIndex, totalKeys, provider);
+    }
+  }
+
+  throw new Error(`Semua API key Snifox gagal dipakai. Terakhir: ${truncateText(lastErrorText)}`);
+}
+
 async function callGeminiWithRetry({ apiKeys, userId, model, prompt, visualPart, signal }) {
   const parts = [{ text: prompt }];
   if (visualPart) {
@@ -767,6 +900,41 @@ async function callGeminiWithRetry({ apiKeys, userId, model, prompt, visualPart,
     userId,
     model,
     parts,
+    signal
+  });
+
+  const parsed = parseResponseText(text);
+  if (!parsed || !parsed.title || !parsed.description || !Array.isArray(parsed.keywords)) {
+    throw new Error("Invalid JSON format from AI");
+  }
+
+  return {
+    title: parsed.title.trim(),
+    description: parsed.description.trim().slice(0, 150),
+    keywords: parsed.keywords.map((value) => String(value).trim()).filter(Boolean),
+    categoryAdobe: parsed.categoryAdobe || 1,
+    categoryShutterstock: parsed.categoryShutterstock || "People"
+  };
+}
+
+async function callSnifoxWithRetry({ apiKeys, userId, model, prompt, visualPart, signal }) {
+  const content = [{ type: "text", text: prompt }];
+  if (visualPart?.inline_data?.data) {
+    content.push({
+      type: "image_url",
+      image_url: {
+        url: `data:${visualPart.inline_data?.mime_type || "image/jpeg"};base64,${visualPart.inline_data.data}`
+      }
+    });
+  }
+
+  const { text } = await callSnifoxWithRotation({
+    apiKeys,
+    userId,
+    model,
+    messages: [{ role: "user", content }],
+    temperature: 0.3,
+    responseFormat: { type: "json_object" },
     signal
   });
 
@@ -845,12 +1013,58 @@ async function rewriteTitleToMaxLength({
   return String(parsed.title).trim();
 }
 
-app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (req, res) => {
-  console.log(`[Metadata] Starting generation for ${req.files?.length || 0} files. User: ${req.session.userId}`);
-  const userId = req.session.userId;
-  const apiKeys = getUserApiKeys(userId);
+async function rewriteTitleToMaxLengthSnifox({
+  apiKeys,
+  userId,
+  model,
+  originalTitle,
+  maxLength,
+  prefix,
+  suffix,
+  platformsLabel,
+  signal
+}) {
+  const prefixInstruction = prefix ? `Use this prefix in the title: "${prefix}".` : "";
+  const suffixInstruction = suffix ? `Use this suffix in the title: "${suffix}".` : "";
 
-  const model = req.body.model || "gemini-3-flash-preview";
+  const prompt = [
+    `You are editing a stock content title for ${platformsLabel}.`,
+    "",
+    "Constraints:",
+    `- Title MUST be <= ${maxLength} characters (count includes spaces).`,
+    "- Do NOT cut words in the middle.",
+    "- Keep meaning and searchability.",
+    `- ${prefixInstruction}`,
+    `- ${suffixInstruction}`,
+    "",
+    "Original title:",
+    originalTitle,
+    "",
+    "Return VALID JSON ONLY (no markdown):",
+    '{ "title": "..." }'
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const { text } = await callSnifoxWithRotation({
+    apiKeys,
+    userId,
+    model,
+    messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+    temperature: 0.2,
+    responseFormat: { type: "json_object" },
+    signal
+  });
+
+  const parsed = parseResponseText(text);
+  if (!parsed || !parsed.title) {
+    throw new Error("Invalid JSON format from AI (title rewrite)");
+  }
+
+  return String(parsed.title).trim();
+}
+
+function getMetadataRequestOptions(req) {
   const titleLength = Number(req.body.titleLength ?? 80);
   const keywordCount = Number(req.body.keywordCount ?? 12);
   const promptProfileRaw = String(req.body.promptProfile || "legacy");
@@ -870,20 +1084,32 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
     platforms
   };
 
-  // If any selected platform has a strict max title length (e.g. Adobe 70),
-  // clamp here so the AI is instructed correctly and we avoid any UI-side truncation.
   options.titleLength = getEffectiveTitleLength(options);
   if (options.promptProfile === "ai_search_visibility") {
     options.titleLength = Math.min(options.titleLength, PLATFORM_TITLE_LIMITS["Adobe Stock"] || 70);
     options.keywordCount = Math.max(3, Math.min(49, options.keywordCount));
   }
 
-  if (!apiKeys.length) return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
+  return options;
+}
+
+async function handleMetadataGenerate(req, res, config) {
+  const { provider, defaultModel, callMetadata, rewriteTitle } = config;
+  const providerLabel = getProviderLabel(provider);
+
+  console.log(`[Metadata:${providerLabel}] Starting generation for ${req.files?.length || 0} files. User: ${req.session.userId}`);
+  const userId = req.session.userId;
+  const apiKeys = getUserApiKeys(userId, provider);
+  const model = String(req.body.model || "").trim() || defaultModel;
+  const options = getMetadataRequestOptions(req);
+
+  if (!apiKeys.length) return res.status(400).json({ error: `Masukkan minimal satu API key ${providerLabel}.` });
+  if (!model) return res.status(400).json({ error: `Model ${providerLabel} wajib diisi.` });
 
   const files = req.files || [];
   if (!files.length) return res.status(400).json({ error: "Unggah minimal satu file." });
 
-  console.log(`[Metadata] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length)}.`);
+  console.log(`[Metadata:${providerLabel}] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length, provider)}.`);
   const processController = startUserProcess(userId, "metadata");
   const { signal } = processController;
 
@@ -904,9 +1130,9 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
 
       try {
         const prompt = buildPrompt({ ...file, ext }, options);
-        console.log(`[Metadata] Processing: ${file.originalname}...`);
+        console.log(`[Metadata:${providerLabel}] Processing: ${file.originalname}...`);
         const visualPart = await getVisualPart(file);
-        const result = await callGeminiWithRetry({
+        const result = await callMetadata({
           apiKeys,
           userId,
           model,
@@ -920,7 +1146,7 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
           const prefix = options.prefixEnabled && options.prefixText ? options.prefixText.trim() : "";
           const suffix = options.suffixEnabled && options.suffixText ? options.suffixText.trim() : "";
 
-          const rewritten = await rewriteTitleToMaxLength({
+          const rewritten = await rewriteTitle({
             apiKeys,
             userId,
             model,
@@ -957,7 +1183,7 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
       items.push(entry);
     }
 
-    console.log(`[Metadata] Finished processing ${items.length} files.`);
+    console.log(`[Metadata:${providerLabel}] Finished processing ${items.length} files.`);
     return res.json({ items });
   } catch (error) {
     if (isAbortLikeError(error)) {
@@ -968,6 +1194,24 @@ app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (re
   } finally {
     finishUserProcess(userId, "metadata", processController);
   }
+}
+
+app.post("/api/generate", isAuthenticated, upload.array("files", 100), async (req, res) => {
+  return handleMetadataGenerate(req, res, {
+    provider: PROVIDERS.GEMINI,
+    defaultModel: DEFAULT_GEMINI_METADATA_MODEL,
+    callMetadata: callGeminiWithRetry,
+    rewriteTitle: rewriteTitleToMaxLength
+  });
+});
+
+app.post("/api/snifox/generate", isAuthenticated, upload.array("files", 100), async (req, res) => {
+  return handleMetadataGenerate(req, res, {
+    provider: PROVIDERS.SNIFOX,
+    defaultModel: DEFAULT_SNIFOX_MODEL,
+    callMetadata: callSnifoxWithRetry,
+    rewriteTitle: rewriteTitleToMaxLengthSnifox
+  });
 });
 
 
@@ -980,76 +1224,14 @@ app.get("/health", (req, res) => {
 
 
 
-// --- IMG TO PROMPT ROUTE ---
-
-app.post("/api/imgtoprompt", isAuthenticated, upload.array("images", 100), async (req, res) => {
-  console.log(`[ImgToPrompt] Starting for ${req.files?.length || 0} images. User: ${req.session.userId}`);
-  const images = req.files || [];
-  const model = req.body.model || "gemini-3-flash-preview";
-  const creativity = Math.max(0, Math.min(100, Number(req.body.creativity || 50)));
-  const camera = req.body.camera === "on";
-  const userId = req.session.userId;
-  const apiKeys = getUserApiKeys(userId);
-  
-  if (!apiKeys.length) return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
-  if (!images.length) return res.status(400).json({ error: "Unggah minimal satu file gambar." });
-
-  function buildImgPrompt() {
-    return `Analyze this image and generate a high-quality, professional prompt for AI image generators (like Midjourney or Stable Diffusion). 
-The prompt should be realistic, natural, and suitable for commercial stock photography.
-
-Constraints:
-- Focus on realism and detailed descriptions.
-- Creativity Level: ${creativity}/100 (where 100 is highly descriptive and artistic).
-${camera ? "- Include professional camera settings (lens, lighting, aperture, etc)." : ""}
-- IMPORTANT: DO NOT use these words: cyber, futuristic, sci-fi, robot, ai, hologram, technology, logo, brand, watermark.
-- Do not mention any famous names or trademarks.
-- Return ONLY the prompt text. No explanation or JSON.`;
-  }
-
-  console.log(`[ImgToPrompt] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length)}.`);
-  const processController = startUserProcess(userId, "imgtoprompt");
-  const { signal } = processController;
-
-  try {
-    const results = [];
-    for (const file of images) {
-      assertProcessActive(signal);
-
-      try {
-        const promptText = buildImgPrompt();
-        const prompt = await callGeminiMultimodalWithSDK({
-          apiKeys,
-          userId,
-          model,
-          prompt: promptText,
-          imageBuffer: file.buffer,
-          mimeType: file.mimetype,
-          signal
-        });
-        results.push({ fileName: file.originalname, prompt, error: null });
-      } catch (err) {
-        if (isAbortLikeError(err)) {
-          throw err;
-        }
-
-        results.push({ fileName: file.originalname, prompt: "", error: err.message });
-      }
-    }
-
-    return res.json({ results });
-  } catch (error) {
-    if (isAbortLikeError(error)) {
-      return res.status(409).json({ error: "Proses Img To Prompt dihentikan oleh pengguna." });
-    }
-
-    throw error;
-  } finally {
-    finishUserProcess(userId, "imgtoprompt", processController);
-  }
-});
-
 // --- SHARED HELPERS FOR PROMPT STUDIO & IMG TO PROMPT ---
+
+function buildImgToPromptInstruction(creativity, cameraOn) {
+  return `Analyze this image and generate a high-quality, professional prompt for AI image generators. 
+Realistic, commercial stock style. Creativity: ${creativity}/100.
+${cameraOn ? "Include camera settings." : ""}
+Return ONLY the prompt text.`;
+}
 
 async function callGeminiWithSDK({ apiKeys, userId, model: modelId, prompt, signal }) {
   const { text } = await callGeminiWithRotation({
@@ -1058,6 +1240,19 @@ async function callGeminiWithSDK({ apiKeys, userId, model: modelId, prompt, sign
     model: modelId,
     parts: [{ text: prompt }],
     generationConfig: { temperature: 0.9 },
+    signal
+  });
+
+  return text;
+}
+
+async function callSnifoxWithSDK({ apiKeys, userId, model: modelId, prompt, signal }) {
+  const { text } = await callSnifoxWithRotation({
+    apiKeys,
+    userId,
+    model: modelId,
+    messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+    temperature: 0.9,
     signal
   });
 
@@ -1092,6 +1287,40 @@ async function callGeminiMultimodalWithSDK({
   return text;
 }
 
+async function callSnifoxMultimodalWithSDK({
+  apiKeys,
+  userId,
+  model: modelId,
+  prompt,
+  imageBuffer,
+  mimeType,
+  signal
+}) {
+  const { text } = await callSnifoxWithRotation({
+    apiKeys,
+    userId,
+    model: modelId,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          {
+            type: "image_url",
+            image_url: {
+              url: `data:${mimeType || "image/jpeg"};base64,${imageBuffer.toString("base64")}`
+            }
+          }
+        ]
+      }
+    ],
+    temperature: 0.7,
+    signal
+  });
+
+  return text;
+}
+
 async function callPromptStudioWithRotation({ apiKeys, userId, model, instruction, signal }) {
   const { text, keyIndex } = await callGeminiWithRotation({
     apiKeys,
@@ -1108,8 +1337,84 @@ async function callPromptStudioWithRotation({ apiKeys, userId, model, instructio
   };
 }
 
-// --- PROMPT STUDIO ENDPOINT ---
-app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
+async function callPromptStudioWithSnifox({ apiKeys, userId, model, instruction, signal }) {
+  const { text, keyIndex } = await callSnifoxWithRotation({
+    apiKeys,
+    userId,
+    model,
+    messages: [{ role: "user", content: [{ type: "text", text: instruction }] }],
+    temperature: 0.7,
+    responseFormat: { type: "json_object" },
+    signal
+  });
+
+  return {
+    result: safeParseJSONObject(text),
+    keyIndex
+  };
+}
+
+async function handleImgToPromptBatch(req, res, config) {
+  const { provider, defaultModel, callMultimodal } = config;
+  const providerLabel = getProviderLabel(provider);
+
+  console.log(`[ImgToPrompt:${providerLabel}] Starting for ${req.files?.length || 0} images. User: ${req.session.userId}`);
+  const images = req.files || [];
+  const model = String(req.body.model || "").trim() || defaultModel;
+  const creativity = Math.max(0, Math.min(100, Number(req.body.creativity || 50)));
+  const camera = req.body.camera === "on";
+  const userId = req.session.userId;
+  const apiKeys = getUserApiKeys(userId, provider);
+
+  if (!apiKeys.length) return res.status(400).json({ error: `Masukkan minimal satu API key ${providerLabel}.` });
+  if (!model) return res.status(400).json({ error: `Model ${providerLabel} wajib diisi.` });
+  if (!images.length) return res.status(400).json({ error: "Unggah minimal satu file gambar." });
+
+  console.log(`[ImgToPrompt:${providerLabel}] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length, provider)}.`);
+  const processController = startUserProcess(userId, "imgtoprompt");
+  const { signal } = processController;
+
+  try {
+    const results = [];
+    for (const file of images) {
+      assertProcessActive(signal);
+
+      try {
+        const promptText = buildImgToPromptInstruction(creativity, camera);
+        const prompt = await callMultimodal({
+          apiKeys,
+          userId,
+          model,
+          prompt: promptText,
+          imageBuffer: file.buffer,
+          mimeType: file.mimetype,
+          signal
+        });
+        results.push({ fileName: file.originalname, prompt, error: null });
+      } catch (err) {
+        if (isAbortLikeError(err)) {
+          throw err;
+        }
+
+        results.push({ fileName: file.originalname, prompt: "", error: err.message });
+      }
+    }
+
+    return res.json({ results });
+  } catch (error) {
+    if (isAbortLikeError(error)) {
+      return res.status(409).json({ error: "Proses Img To Prompt dihentikan oleh pengguna." });
+    }
+
+    throw error;
+  } finally {
+    finishUserProcess(userId, "imgtoprompt", processController);
+  }
+}
+
+async function handlePromptStudioGenerate(req, res, config) {
+  const { provider, defaultModel, callPromptStudio } = config;
+  const providerLabel = getProviderLabel(provider);
   const userId = req.session.userId;
   const payload = req.body || {};
   const batchSize = Math.max(1, Math.min(20, Number(payload.count || 1)));
@@ -1120,7 +1425,7 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
   const activity = String(payload.activity || "").trim();
   const background = String(payload.background || "").trim();
   const lang = payload.lang === "id" ? "id" : "en";
-  const model = String(payload.model || "").trim() || "gemini-2.5-flash";
+  const model = String(payload.model || "").trim() || defaultModel;
 
   if (!purpose) {
     return res.status(400).json({ error: "Purpose wajib diisi." });
@@ -1142,9 +1447,12 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
     }
   }
 
-  const apiKeys = getUserApiKeys(userId);
+  const apiKeys = getUserApiKeys(userId, provider);
   if (!apiKeys.length) {
-    return res.status(400).json({ error: "Masukkan minimal satu API key Gemini." });
+    return res.status(400).json({ error: `Masukkan minimal satu API key ${providerLabel}.` });
+  }
+  if (!model) {
+    return res.status(400).json({ error: `Model ${providerLabel} wajib diisi.` });
   }
 
   const collected = [];
@@ -1154,7 +1462,7 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
   const { signal } = processController;
 
   try {
-    console.log(`[PromptStudio] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length)}.`);
+    console.log(`[PromptStudio:${providerLabel}] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length, provider)}.`);
 
     for (let round = 1; round <= maxRounds; round += 1) {
       assertProcessActive(signal);
@@ -1174,7 +1482,7 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
         blockedPrompts: collectedPrompts
       });
 
-      const output = await callPromptStudioWithRotation({
+      const output = await callPromptStudio({
         apiKeys,
         userId,
         model,
@@ -1207,42 +1515,41 @@ app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
       return res.status(409).json({ error: "Proses Prompt Studio dihentikan oleh pengguna." });
     }
 
-    console.error(`[PromptStudio] Error: ${err.message}`);
+    console.error(`[PromptStudio:${providerLabel}] Error: ${err.message}`);
     res.status(500).json({ error: err.message || "Internal server error" });
   } finally {
     finishUserProcess(userId, "prompt-studio", processController);
   }
-});
+}
 
-// --- UPDATED IMG TO PROMPT ROUTE (SDK) ---
-app.post("/api/imgtoprompt/single", isAuthenticated, upload.single("image"), async (req, res) => {
+async function handleImgToPromptSingle(req, res, config) {
+  const { provider, defaultModel, callMultimodal } = config;
+  const providerLabel = getProviderLabel(provider);
   const file = req.file;
   const userId = req.session.userId;
   const { model, creativity, camera } = req.body;
 
   if (!file) return res.status(400).json({ error: "No image uploaded" });
 
-  const apiKeys = getUserApiKeys(userId);
-  if (!apiKeys.length) return res.status(400).json({ error: "Empty API keys" });
+  const apiKeys = getUserApiKeys(userId, provider);
+  if (!apiKeys.length) return res.status(400).json({ error: `Masukkan minimal satu API key ${providerLabel}.` });
+
+  const resolvedModel = String(model || "").trim() || defaultModel;
+  if (!resolvedModel) return res.status(400).json({ error: `Model ${providerLabel} wajib diisi.` });
 
   const processController = startUserProcess(userId, "imgtoprompt");
   const { signal } = processController;
 
   try {
-    console.log(`[ImgToPrompt] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length)}.`);
+    console.log(`[ImgToPrompt:${providerLabel}] API key bank count: ${apiKeys.length}. Active index: ${getNormalizedRotationIndex(userId, apiKeys.length, provider)}.`);
     const creativityVal = Math.max(0, Math.min(100, Number(creativity || 50)));
     const cameraOn = camera === "true" || camera === "on";
-    
-    const promptText = `Analyze this image and generate a high-quality, professional prompt for AI image generators. 
-Realistic, commercial stock style. Creativity: ${creativityVal}/100.
-${cameraOn ? "Include camera settings." : ""}
-Return ONLY the prompt text.`;
 
-    const prompt = await callGeminiMultimodalWithSDK({
+    const prompt = await callMultimodal({
       apiKeys,
       userId,
-      model: model || "gemini-3-flash-preview",
-      prompt: promptText,
+      model: resolvedModel,
+      prompt: buildImgToPromptInstruction(creativityVal, cameraOn),
       imageBuffer: file.buffer,
       mimeType: file.mimetype,
       signal
@@ -1254,11 +1561,60 @@ Return ONLY the prompt text.`;
       return res.status(409).json({ error: "Proses Img To Prompt dihentikan oleh pengguna." });
     }
 
-    console.error(`[ImgToPrompt SDK] Error: ${err.message}`);
+    console.error(`[ImgToPrompt:${providerLabel}] Error: ${err.message}`);
     res.status(500).json({ error: err.message });
   } finally {
     finishUserProcess(userId, "imgtoprompt", processController);
   }
+}
+
+// --- PROMPT STUDIO ENDPOINT ---
+app.post("/api/imgtoprompt", isAuthenticated, upload.array("images", 100), async (req, res) => {
+  return handleImgToPromptBatch(req, res, {
+    provider: PROVIDERS.GEMINI,
+    defaultModel: DEFAULT_GEMINI_IMGTOPROMPT_MODEL,
+    callMultimodal: callGeminiMultimodalWithSDK
+  });
+});
+
+app.post("/api/snifox/imgtoprompt", isAuthenticated, upload.array("images", 100), async (req, res) => {
+  return handleImgToPromptBatch(req, res, {
+    provider: PROVIDERS.SNIFOX,
+    defaultModel: DEFAULT_SNIFOX_MODEL,
+    callMultimodal: callSnifoxMultimodalWithSDK
+  });
+});
+
+app.post("/api/prompt-studio/generate", isAuthenticated, async (req, res) => {
+  return handlePromptStudioGenerate(req, res, {
+    provider: PROVIDERS.GEMINI,
+    defaultModel: DEFAULT_GEMINI_PROMPT_STUDIO_MODEL,
+    callPromptStudio: callPromptStudioWithRotation
+  });
+});
+
+app.post("/api/snifox/prompt-studio/generate", isAuthenticated, async (req, res) => {
+  return handlePromptStudioGenerate(req, res, {
+    provider: PROVIDERS.SNIFOX,
+    defaultModel: DEFAULT_SNIFOX_MODEL,
+    callPromptStudio: callPromptStudioWithSnifox
+  });
+});
+
+app.post("/api/imgtoprompt/single", isAuthenticated, upload.single("image"), async (req, res) => {
+  return handleImgToPromptSingle(req, res, {
+    provider: PROVIDERS.GEMINI,
+    defaultModel: DEFAULT_GEMINI_IMGTOPROMPT_MODEL,
+    callMultimodal: callGeminiMultimodalWithSDK
+  });
+});
+
+app.post("/api/snifox/imgtoprompt/single", isAuthenticated, upload.single("image"), async (req, res) => {
+  return handleImgToPromptSingle(req, res, {
+    provider: PROVIDERS.SNIFOX,
+    defaultModel: DEFAULT_SNIFOX_MODEL,
+    callMultimodal: callSnifoxMultimodalWithSDK
+  });
 });
 
 // --- ERROR HANDLER ---

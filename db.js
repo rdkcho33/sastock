@@ -24,11 +24,21 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS api_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'gemini',
     key_value TEXT NOT NULL,
     label TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
   );
 `);
+
+const apiKeysColumns = db.prepare("PRAGMA table_info(api_keys)").all();
+const hasProviderColumn = apiKeysColumns.some((column) => column.name === "provider");
+
+if (!hasProviderColumn) {
+  db.exec("ALTER TABLE api_keys ADD COLUMN provider TEXT NOT NULL DEFAULT 'gemini'");
+}
+
+db.exec("CREATE INDEX IF NOT EXISTS idx_api_keys_user_provider ON api_keys (user_id, provider, id)");
 
 export default db;

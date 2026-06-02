@@ -1,5 +1,6 @@
 const state = {
   user: null,
+  provider: localStorage.getItem("sastock_provider") === "snifox" ? "snifox" : "gemini",
   lang: "en",
   mode: "AUTO",
   results: [],
@@ -7,6 +8,13 @@ const state = {
   stopRequested: false,
   activeController: null
 };
+
+const PROVIDERS = {
+  GEMINI: "gemini",
+  SNIFOX: "snifox"
+};
+const SNIFOX_MODEL_STORAGE_KEY = "sastock_snifox_model";
+const DEFAULT_SNIFOX_MODEL = "google/gemini-2.5-flash";
 
 const logBody = document.getElementById("logBody");
 const toggleLogBtn = document.getElementById("toggleLogBtn");
@@ -17,6 +25,48 @@ const stopBtn = document.getElementById("stopBtn");
 const resultsList = document.getElementById("resultsList");
 const copyAllBtn = document.getElementById("copyAllBtn");
 const clearBtn = document.getElementById("clearBtn");
+
+function getProviderLabel(provider = state.provider) {
+  return provider === PROVIDERS.SNIFOX ? "Snifox" : "Gemini";
+}
+
+function getPromptStudioEndpoint() {
+  return state.provider === PROVIDERS.SNIFOX ? "/api/snifox/prompt-studio/generate" : "/api/prompt-studio/generate";
+}
+
+function getActiveModel() {
+  if (state.provider === PROVIDERS.SNIFOX) {
+    return document.getElementById("snifoxModelInput")?.value.trim() || DEFAULT_SNIFOX_MODEL;
+  }
+  return document.getElementById("modelSelect").value;
+}
+
+function updateProviderUI() {
+  const isSnifox = state.provider === PROVIDERS.SNIFOX;
+  document.querySelectorAll("#providerToggle [data-provider]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.provider === state.provider);
+  });
+
+  const subtitle = document.getElementById("providerSubtitle");
+  const providerHint = document.getElementById("providerHint");
+  const apiKeySectionLabel = document.getElementById("apiKeySectionLabel");
+  const geminiModelGroup = document.getElementById("geminiModelGroup");
+  const snifoxModelGroup = document.getElementById("snifoxModelGroup");
+
+  if (subtitle) {
+    subtitle.textContent = isSnifox ? "Snifox Aggregator Active" : "Google Gemini Direct Active";
+  }
+  if (providerHint) {
+    providerHint.textContent = isSnifox
+      ? "Menggunakan endpoint aggregator Snifox yang kompatibel dengan OpenAI."
+      : "Menggunakan endpoint Google Gemini langsung.";
+  }
+  if (apiKeySectionLabel) {
+    apiKeySectionLabel.textContent = `${getProviderLabel()} API Keys`;
+  }
+  if (geminiModelGroup) geminiModelGroup.hidden = isSnifox;
+  if (snifoxModelGroup) snifoxModelGroup.hidden = !isSnifox;
+}
 
 function logToConsole(message, type = "info") {
   if (!logBody) return;
@@ -87,6 +137,7 @@ async function init() {
     document.getElementById("userRole").textContent = state.user.role;
     document.getElementById("userProfile").style.display = "flex";
 
+    updateProviderUI();
     await fetchKeys();
   } catch {
     window.location.href = "/login.html";
@@ -95,13 +146,16 @@ async function init() {
 
 async function fetchKeys() {
   try {
-    const data = await readJsonResponse(await fetch("/api/keys"));
+    const data = await readJsonResponse(await fetch(`/api/keys?provider=${encodeURIComponent(state.provider)}`));
     const select = document.getElementById("activeKeySelect");
+    const counter = document.getElementById("apiKeyCounter");
 
     if (data.keys && data.keys.length > 0) {
       select.innerHTML = data.keys.map((key) => `<option value="${key.key_value}">${key.label}</option>`).join("");
+      if (counter) counter.textContent = `${data.keys.length} keys available`;
     } else {
-      select.innerHTML = '<option value="">No keys found</option>';
+      select.innerHTML = `<option value="">No ${getProviderLabel()} keys found</option>`;
+      if (counter) counter.textContent = "0 keys available";
     }
   } catch {
     console.error("Failed to fetch keys");
@@ -157,10 +211,20 @@ generateBtn.onclick = async () => {
   const activity = document.getElementById("activityInput").value.trim();
   const background = document.getElementById("backgroundInput").value.trim();
   const batchCount = parseInt(document.getElementById("batchCount").value, 10) || 1;
-  const model = document.getElementById("modelSelect").value;
+  const model = getActiveModel();
 
   if (!purpose || !object) {
     alert("Please fill in both Purpose and Object.");
+    return;
+  }
+
+  if (!document.getElementById("activeKeySelect").value) {
+    alert(`Please save at least one ${getProviderLabel()} API key first.`);
+    return;
+  }
+
+  if (!model) {
+    alert(`Please fill in the ${getProviderLabel()} model first.`);
     return;
   }
 
@@ -186,7 +250,7 @@ generateBtn.onclick = async () => {
   stopBtn.style.display = "block";
   stopBtn.disabled = false;
   clearBtn.disabled = true;
-  logToConsole(`Requesting ${batchCount} prompts in ${state.mode} mode...`, "info");
+  logToConsole(`Requesting ${batchCount} prompts in ${state.mode} mode via ${getProviderLabel()}...`, "info");
 
   const cardIds = [];
   for (let i = 0; i < batchCount; i += 1) {
@@ -196,7 +260,7 @@ generateBtn.onclick = async () => {
   }
 
   try {
-    const response = await fetch("/api/prompt-studio/generate", {
+    const response = await fetch(getPromptStudioEndpoint(), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       signal: state.activeController.signal,
@@ -241,7 +305,7 @@ generateBtn.onclick = async () => {
       copyAllBtn.style.display = "inline-block";
     }
 
-    logToConsole(`Successfully generated ${prompts.length} prompts.`, "success");
+    logToConsole(`Successfully generated ${prompts.length} prompts via ${getProviderLabel()}.`, "success");
   } catch (err) {
     if (err.name === "AbortError" || state.stopRequested) {
       cardIds.forEach((id) => updateCardError(id, "Process stopped by user."));
@@ -314,6 +378,23 @@ clearBtn.onclick = () => {
   copyAllBtn.style.display = "none";
   logToConsole("Workspace cleared.", "system");
 };
+
+document.getElementById("providerToggle")?.addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-provider]");
+  if (!button) return;
+  state.provider = button.dataset.provider === PROVIDERS.SNIFOX ? PROVIDERS.SNIFOX : PROVIDERS.GEMINI;
+  localStorage.setItem("sastock_provider", state.provider);
+  updateProviderUI();
+  await fetchKeys();
+});
+
+document.getElementById("snifoxModelInput")?.addEventListener("input", (event) => {
+  localStorage.setItem(SNIFOX_MODEL_STORAGE_KEY, event.target.value);
+});
+
+if (document.getElementById("snifoxModelInput")) {
+  document.getElementById("snifoxModelInput").value = localStorage.getItem(SNIFOX_MODEL_STORAGE_KEY) || DEFAULT_SNIFOX_MODEL;
+}
 
 setMode("AUTO");
 init();
